@@ -36,19 +36,25 @@ class Executor:
     """
     Executes a fuzzing target.
 
-    The target can be either:
+    The target can be:
 
     1. A Python script path:
 
            Executor("src/target.py")
 
-    2. A Python callable:
+    2. A native executable:
+
+           Executor("native_targets/vulnerable.exe")
+
+    3. A Python callable:
 
            Executor(target_function)
 
-    For script targets, execution happens in a separate
-    Python process and line coverage is collected inside
-    that process.
+    Python script targets use line-level coverage collection.
+
+    Native executable targets currently use subprocess execution
+    and exit-code based crash detection. Native coverage will be
+    added in a later coverage-instrumentation stage.
     """
 
     def __init__(
@@ -74,7 +80,28 @@ class Executor:
         if callable(self.target):
             return self._run_callable(data)
 
+        target_path = Path(self.target)
+
+        if self._is_native_target(target_path):
+            return self._run_native(target_path, data)
+
         return self._run_script(data)
+
+    # =========================================================
+    # TARGET TYPE DETECTION
+    # =========================================================
+
+    def _is_native_target(
+        self,
+        target_path: Path
+    ) -> bool:
+        """
+        Determine whether the target is a native executable.
+
+        Windows executables are identified by the .exe extension.
+        """
+
+        return target_path.suffix.lower() == ".exe"
 
     # =========================================================
     # CALLABLE TARGET
@@ -152,7 +179,122 @@ class Executor:
             )
 
     # =========================================================
-    # SCRIPT TARGET
+    # NATIVE TARGET
+    # =========================================================
+
+    def _run_native(
+        self,
+        target_path: Path,
+        data: bytes
+    ) -> ExecutionResult:
+        """
+        Execute a native binary in a separate process.
+
+        The fuzzing input is supplied through stdin.
+
+        A zero exit code is considered normal execution.
+
+        A non-zero exit code is classified as a crash.
+
+        Native coverage instrumentation is intentionally not
+        implemented here yet. The coverage set remains empty
+        until bitmap/edge instrumentation is added.
+        """
+
+        target_path = target_path.resolve()
+
+        command = [
+            str(target_path)
+        ]
+
+        start = time.perf_counter()
+
+        try:
+
+            process = subprocess.run(
+                command,
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.timeout,
+            )
+
+            duration = (
+                time.perf_counter()
+                - start
+            )
+
+        except subprocess.TimeoutExpired as error:
+
+            duration = (
+                time.perf_counter()
+                - start
+            )
+
+            stdout = error.stdout or b""
+            stderr = error.stderr or b""
+
+            if isinstance(stdout, str):
+                stdout = stdout.encode()
+
+            if isinstance(stderr, str):
+                stderr = stderr.encode()
+
+            return ExecutionResult(
+                status=ExecutionStatus.TIMEOUT,
+                exit_code=None,
+                stdout=stdout,
+                stderr=stderr,
+                duration=duration,
+                coverage=set(),
+            )
+
+        except OSError as error:
+
+            duration = (
+                time.perf_counter()
+                - start
+            )
+
+            return ExecutionResult(
+                status=ExecutionStatus.CRASH,
+                exit_code=None,
+                stdout=b"",
+                stderr=str(error).encode(),
+                duration=duration,
+                coverage=set(),
+            )
+
+        # -----------------------------------------------------
+        # NORMAL EXIT
+        # -----------------------------------------------------
+
+        if process.returncode == 0:
+
+            return ExecutionResult(
+                status=ExecutionStatus.NORMAL,
+                exit_code=process.returncode,
+                stdout=process.stdout,
+                stderr=process.stderr,
+                duration=duration,
+                coverage=set(),
+            )
+
+        # -----------------------------------------------------
+        # NON-ZERO EXIT = CRASH
+        # -----------------------------------------------------
+
+        return ExecutionResult(
+            status=ExecutionStatus.CRASH,
+            exit_code=process.returncode,
+            stdout=process.stdout,
+            stderr=process.stderr,
+            duration=duration,
+            coverage=set(),
+        )
+
+    # =========================================================
+    # PYTHON SCRIPT TARGET
     # =========================================================
 
     def _run_script(
@@ -346,9 +488,9 @@ finally:
             coverage_path
         )
 
-        # =====================================================
+        # -----------------------------------------------------
         # NORMAL EXIT
-        # =====================================================
+        # -----------------------------------------------------
 
         if process.returncode == 0:
 
@@ -361,9 +503,9 @@ finally:
                 coverage=coverage,
             )
 
-        # =====================================================
+        # -----------------------------------------------------
         # NON-ZERO EXIT = CRASH
-        # =====================================================
+        # -----------------------------------------------------
 
         return ExecutionResult(
             status=ExecutionStatus.CRASH,

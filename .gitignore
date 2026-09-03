@@ -28,3 +28,5 @@ test_corpus/
 # OS files
 .DS_Store
 Thumbs.db
+# Native build artifacts
+*.exe
