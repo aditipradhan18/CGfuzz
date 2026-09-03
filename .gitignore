@@ -1,9 +1,30 @@
-# Python virtual environment
-.venv/
-
-# Python generated files
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Environment variables / secrets
-.env
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs / Editors
+.vscode/
+.idea/
+
+# Fuzzing runtime artifacts
+crashes/
+corpus/
+
+# Generated test corpus and coverage files
+test_corpus/
+*.cover
+
+# OS files
+.DS_Store
+Thumbs.db
