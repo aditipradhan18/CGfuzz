@@ -1,370 +1,325 @@
+from __future__ import annotations
+
+import os
+import re
+import runpy
 import subprocess
 import sys
-import time
 import tempfile
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Any
+from typing import Callable, Optional, Union
 
+
+# ============================================================
+# EXECUTION STATUS
+# ============================================================
 
 class ExecutionStatus(Enum):
-    """
-    Result of executing the target.
-    """
-
     NORMAL = "normal"
     CRASH = "crash"
     TIMEOUT = "timeout"
 
 
+# ============================================================
+# EXECUTION RESULT
+# ============================================================
+
 @dataclass
 class ExecutionResult:
-    """
-    Stores information about one target execution.
-    """
-
     status: ExecutionStatus
-    exit_code: int | None = None
-    stdout: bytes = b""
+    exit_code: int
     stderr: bytes = b""
+    stdout: bytes = b""
     duration: float = 0.0
     coverage: set = field(default_factory=set)
 
+    @property
+    def output(self) -> bytes:
+        return self.stdout
+
+    @property
+    def crashed(self) -> bool:
+        return self.status == ExecutionStatus.CRASH
+
+    @property
+    def timed_out(self) -> bool:
+        return self.status == ExecutionStatus.TIMEOUT
+
+    @property
+    def normal(self) -> bool:
+        return self.status == ExecutionStatus.NORMAL
+
+
+# ============================================================
+# EXECUTOR
+# ============================================================
 
 class Executor:
     """
-    Executes a fuzzing target.
+    Execute Python or native targets in an isolated subprocess.
 
-    The target can be:
+    Supported targets:
+        - Python script (.py)
+        - Native executable (.exe / binary)
+        - Python callable
 
-    1. A Python script path:
-
-           Executor("src/target.py")
-
-    2. A native executable:
-
-           Executor("native_targets/vulnerable.exe")
-
-    3. A Python callable:
-
-           Executor(target_function)
-
-    Python script targets use line-level coverage collection.
-
-    Native executable targets currently use subprocess execution
-    and exit-code based crash detection. Native coverage will be
-    added in a later coverage-instrumentation stage.
+    Native targets can optionally provide GCC/gcov coverage
+    when compiled with coverage instrumentation.
     """
 
     def __init__(
         self,
-        target: str | Path | Callable[[bytes], Any],
-        timeout: float = 1.0
+        target: Union[str, Path, Callable],
+        timeout: float = 1.0,
     ):
-        self.target = target
-        self.timeout = timeout
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
 
-    # =========================================================
-    # MAIN EXECUTION
-    # =========================================================
+        self.target = target
+        self.timeout = float(timeout)
+
+        self._is_callable = callable(target)
+
+        if self._is_callable:
+            self.target_path: Optional[Path] = None
+        else:
+            self.target_path = Path(target)
+
+    # ========================================================
+    # MAIN EXECUTION API
+    # ========================================================
 
     def run(self, data: bytes) -> ExecutionResult:
         """
-        Execute the target with the supplied input.
+        Execute target with supplied input.
         """
 
         if not isinstance(data, bytes):
-            data = bytes(data)
-
-        if callable(self.target):
-            return self._run_callable(data)
-
-        target_path = Path(self.target)
-
-        if self._is_native_target(target_path):
-            return self._run_native(target_path, data)
-
-        return self._run_script(data)
-
-    # =========================================================
-    # TARGET TYPE DETECTION
-    # =========================================================
-
-    def _is_native_target(
-        self,
-        target_path: Path
-    ) -> bool:
-        """
-        Determine whether the target is a native executable.
-
-        Windows executables are identified by the .exe extension.
-        """
-
-        return target_path.suffix.lower() == ".exe"
-
-    # =========================================================
-    # CALLABLE TARGET
-    # =========================================================
-
-    def _run_callable(
-        self,
-        data: bytes
-    ) -> ExecutionResult:
-        """
-        Execute a Python callable target.
-        """
+            raise TypeError("data must be bytes")
 
         start = time.perf_counter()
 
-        try:
+        if self._is_callable:
+            return self._run_callable(data, start)
 
+        if self.target_path is None:
+            raise RuntimeError("Invalid target")
+
+        if not self.target_path.exists():
+            raise FileNotFoundError(
+                f"Target not found: {self.target_path}"
+            )
+
+        if self._is_python_target():
+            return self._run_python_target(data, start)
+
+        return self._run_native_target(data, start)
+
+    # ========================================================
+    # CALLABLE TARGET
+    # ========================================================
+
+    def _run_callable(
+        self,
+        data: bytes,
+        start: float,
+    ) -> ExecutionResult:
+        """
+        Execute a Python callable.
+
+        This path is mainly used by unit tests and programmatic
+        integrations.
+        """
+
+        stdout = b""
+        stderr = b""
+
+        try:
             result = self.target(data)
 
-            duration = time.perf_counter() - start
-
-            if isinstance(result, ExecutionResult):
-
-                if result.duration == 0.0:
-                    result.duration = duration
-
-                return result
-
-            stdout = b""
-
             if result is not None:
-
                 if isinstance(result, bytes):
                     stdout = result
-
-                elif isinstance(result, str):
-                    stdout = result.encode()
-
                 else:
                     stdout = str(result).encode()
+
+            duration = time.perf_counter() - start
 
             return ExecutionResult(
                 status=ExecutionStatus.NORMAL,
                 exit_code=0,
-                stdout=stdout,
-                stderr=b"",
-                duration=duration,
-                coverage=set(),
-            )
-
-        except TimeoutError as error:
-
-            duration = time.perf_counter() - start
-
-            return ExecutionResult(
-                status=ExecutionStatus.TIMEOUT,
-                exit_code=None,
-                stdout=b"",
-                stderr=str(error).encode(),
-                duration=duration,
-                coverage=set(),
-            )
-
-        except Exception as error:
-
-            duration = time.perf_counter() - start
-
-            return ExecutionResult(
-                status=ExecutionStatus.CRASH,
-                exit_code=1,
-                stdout=b"",
-                stderr=str(error).encode(),
-                duration=duration,
-                coverage=set(),
-            )
-
-    # =========================================================
-    # NATIVE TARGET
-    # =========================================================
-
-    def _run_native(
-        self,
-        target_path: Path,
-        data: bytes
-    ) -> ExecutionResult:
-        """
-        Execute a native binary in a separate process.
-
-        The fuzzing input is supplied through stdin.
-
-        A zero exit code is considered normal execution.
-
-        A non-zero exit code is classified as a crash.
-
-        Native coverage instrumentation is intentionally not
-        implemented here yet. The coverage set remains empty
-        until bitmap/edge instrumentation is added.
-        """
-
-        target_path = target_path.resolve()
-
-        command = [
-            str(target_path)
-        ]
-
-        start = time.perf_counter()
-
-        try:
-
-            process = subprocess.run(
-                command,
-                input=data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout,
-            )
-
-            duration = (
-                time.perf_counter()
-                - start
-            )
-
-        except subprocess.TimeoutExpired as error:
-
-            duration = (
-                time.perf_counter()
-                - start
-            )
-
-            stdout = error.stdout or b""
-            stderr = error.stderr or b""
-
-            if isinstance(stdout, str):
-                stdout = stdout.encode()
-
-            if isinstance(stderr, str):
-                stderr = stderr.encode()
-
-            return ExecutionResult(
-                status=ExecutionStatus.TIMEOUT,
-                exit_code=None,
                 stdout=stdout,
                 stderr=stderr,
                 duration=duration,
                 coverage=set(),
             )
 
-        except OSError as error:
+        except BaseException as exc:
+            duration = time.perf_counter() - start
 
-            duration = (
-                time.perf_counter()
-                - start
-            )
+            message = f"{type(exc).__name__}: {exc}"
 
             return ExecutionResult(
                 status=ExecutionStatus.CRASH,
-                exit_code=None,
-                stdout=b"",
-                stderr=str(error).encode(),
+                exit_code=1,
+                stdout=stdout,
+                stderr=message.encode(),
                 duration=duration,
                 coverage=set(),
             )
 
-        # -----------------------------------------------------
-        # NORMAL EXIT
-        # -----------------------------------------------------
+    # ========================================================
+    # PYTHON TARGET
+    # ========================================================
 
-        if process.returncode == 0:
-
-            return ExecutionResult(
-                status=ExecutionStatus.NORMAL,
-                exit_code=process.returncode,
-                stdout=process.stdout,
-                stderr=process.stderr,
-                duration=duration,
-                coverage=set(),
-            )
-
-        # -----------------------------------------------------
-        # NON-ZERO EXIT = CRASH
-        # -----------------------------------------------------
-
-        return ExecutionResult(
-            status=ExecutionStatus.CRASH,
-            exit_code=process.returncode,
-            stdout=process.stdout,
-            stderr=process.stderr,
-            duration=duration,
-            coverage=set(),
-        )
-
-    # =========================================================
-    # PYTHON SCRIPT TARGET
-    # =========================================================
-
-    def _run_script(
+    def _run_python_target(
         self,
-        data: bytes
+        data: bytes,
+        start: float,
     ) -> ExecutionResult:
         """
-        Execute a Python script in a separate process.
+        Execute a Python target in a child process.
 
-        A small wrapper is executed around target.py.
-
-        The wrapper:
-
-            1. Starts Python tracing.
-            2. Executes target.py.
-            3. Records target.py line numbers.
-            4. Writes the coverage to a temporary file.
-            5. Preserves the target's exit status.
-
-        This is necessary because sys.settrace() in the
-        parent process cannot trace a separate subprocess.
+        Line coverage is collected using sys.settrace().
         """
 
-        target_path = Path(self.target).resolve()
-
-        # -----------------------------------------------------
-        # TEMPORARY COVERAGE FILE
-        # -----------------------------------------------------
-
         coverage_file = tempfile.NamedTemporaryFile(
-            mode="w",
             suffix=".coverage",
             delete=False,
-            encoding="utf-8"
         )
 
-        coverage_path = Path(
-            coverage_file.name
-        )
-
+        coverage_path = Path(coverage_file.name)
         coverage_file.close()
 
-        # -----------------------------------------------------
-        # COVERAGE WRAPPER
-        # -----------------------------------------------------
+        wrapper = self._create_python_wrapper(
+            self.target_path,
+            coverage_path,
+        )
 
-        wrapper = r'''
-import runpy
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(wrapper)],
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.timeout,
+            )
+
+            duration = time.perf_counter() - start
+
+            coverage = self._read_python_coverage(
+                coverage_path
+            )
+
+            if completed.returncode == 0:
+                status = ExecutionStatus.NORMAL
+            else:
+                status = ExecutionStatus.CRASH
+
+            return ExecutionResult(
+                status=status,
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                duration=duration,
+                coverage=coverage,
+            )
+
+        except subprocess.TimeoutExpired as exc:
+            duration = time.perf_counter() - start
+
+            stdout = self._safe_bytes(exc.stdout)
+            stderr = self._safe_bytes(exc.stderr)
+
+            return ExecutionResult(
+                status=ExecutionStatus.TIMEOUT,
+                exit_code=-1,
+                stdout=stdout,
+                stderr=stderr,
+                duration=duration,
+                coverage=set(),
+            )
+
+        except OSError as exc:
+            duration = time.perf_counter() - start
+
+            return ExecutionResult(
+                status=ExecutionStatus.CRASH,
+                exit_code=-1,
+                stdout=b"",
+                stderr=str(exc).encode(),
+                duration=duration,
+                coverage=set(),
+            )
+
+        finally:
+            try:
+                coverage_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            try:
+                wrapper.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # ========================================================
+    # PYTHON WRAPPER
+    # ========================================================
+
+    def _create_python_wrapper(
+        self,
+        target_path: Path,
+        coverage_path: Path,
+    ) -> Path:
+        """
+        Create a temporary Python wrapper which:
+
+        1. Reads stdin through the target itself.
+        2. Installs a line tracer.
+        3. Executes the target.
+        4. Saves executed target lines.
+        """
+
+        wrapper = Path(
+            tempfile.mktemp(
+                prefix="cgfuzz_wrapper_",
+                suffix=".py",
+            )
+        )
+
+        target = str(target_path.resolve()).replace(
+            "\\",
+            "\\\\",
+        )
+
+        coverage = str(coverage_path.resolve()).replace(
+            "\\",
+            "\\\\",
+        )
+
+        source = f'''
 import sys
+import runpy
 
+TARGET = r"{target}"
+COVERAGE = r"{coverage}"
 
-target_path = sys.argv[1]
-coverage_path = sys.argv[2]
-
-covered_lines = set()
+executed = set()
 
 
 def trace(frame, event, arg):
-    """
-    Record executed lines belonging to target.py.
-    """
-
     if event == "line":
-
         filename = frame.f_code.co_filename
 
-        if filename == target_path:
-            covered_lines.add(
-                frame.f_lineno
-            )
+        try:
+            if filename == TARGET:
+                executed.add(frame.f_lineno)
+        except Exception:
+            pass
 
     return trace
 
@@ -372,161 +327,42 @@ def trace(frame, event, arg):
 sys.settrace(trace)
 
 try:
-
     runpy.run_path(
-        target_path,
-        run_name="__main__"
+        TARGET,
+        run_name="__main__",
     )
-
 finally:
-
     sys.settrace(None)
 
-    with open(
-        coverage_path,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        for line in sorted(covered_lines):
-            file.write(
-                f"{line}\n"
-            )
+    try:
+        with open(
+            COVERAGE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            for line in sorted(executed):
+                f.write(str(line) + "\\n")
+    except Exception:
+        pass
 '''
 
-        # -----------------------------------------------------
-        # COMMAND
-        # -----------------------------------------------------
-
-        command = [
-            sys.executable,
-            "-c",
-            wrapper,
-            str(target_path),
-            str(coverage_path),
-        ]
-
-        start = time.perf_counter()
-
-        try:
-
-            process = subprocess.run(
-                command,
-                input=data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout,
-            )
-
-            duration = (
-                time.perf_counter()
-                - start
-            )
-
-        except subprocess.TimeoutExpired as error:
-
-            duration = (
-                time.perf_counter()
-                - start
-            )
-
-            stdout = error.stdout or b""
-            stderr = error.stderr or b""
-
-            if isinstance(stdout, str):
-                stdout = stdout.encode()
-
-            if isinstance(stderr, str):
-                stderr = stderr.encode()
-
-            coverage = self._read_coverage(
-                coverage_path
-            )
-
-            self._delete_coverage_file(
-                coverage_path
-            )
-
-            return ExecutionResult(
-                status=ExecutionStatus.TIMEOUT,
-                exit_code=None,
-                stdout=stdout,
-                stderr=stderr,
-                duration=duration,
-                coverage=coverage,
-            )
-
-        except OSError as error:
-
-            duration = (
-                time.perf_counter()
-                - start
-            )
-
-            self._delete_coverage_file(
-                coverage_path
-            )
-
-            return ExecutionResult(
-                status=ExecutionStatus.CRASH,
-                exit_code=None,
-                stdout=b"",
-                stderr=str(error).encode(),
-                duration=duration,
-                coverage=set(),
-            )
-
-        # -----------------------------------------------------
-        # READ COVERAGE
-        # -----------------------------------------------------
-
-        coverage = self._read_coverage(
-            coverage_path
+        wrapper.write_text(
+            source,
+            encoding="utf-8",
         )
 
-        self._delete_coverage_file(
-            coverage_path
-        )
+        return wrapper
 
-        # -----------------------------------------------------
-        # NORMAL EXIT
-        # -----------------------------------------------------
+    # ========================================================
+    # PYTHON COVERAGE READER
+    # ========================================================
 
-        if process.returncode == 0:
-
-            return ExecutionResult(
-                status=ExecutionStatus.NORMAL,
-                exit_code=process.returncode,
-                stdout=process.stdout,
-                stderr=process.stderr,
-                duration=duration,
-                coverage=coverage,
-            )
-
-        # -----------------------------------------------------
-        # NON-ZERO EXIT = CRASH
-        # -----------------------------------------------------
-
-        return ExecutionResult(
-            status=ExecutionStatus.CRASH,
-            exit_code=process.returncode,
-            stdout=process.stdout,
-            stderr=process.stderr,
-            duration=duration,
-            coverage=coverage,
-        )
-
-    # =========================================================
-    # READ COVERAGE
-    # =========================================================
-
-    def _read_coverage(
+    def _read_python_coverage(
         self,
-        coverage_path: Path
+        coverage_path: Path,
     ) -> set:
         """
-        Read coverage line numbers produced by the
-        subprocess wrapper.
+        Read line numbers produced by the Python tracer.
         """
 
         coverage = set()
@@ -535,105 +371,371 @@ finally:
             return coverage
 
         try:
+            content = coverage_path.read_text(
+                encoding="utf-8",
+            )
 
-            with coverage_path.open(
-                "r",
-                encoding="utf-8"
-            ) as file:
+            for line in content.splitlines():
+                line = line.strip()
 
-                for line in file:
+                if line.isdigit():
+                    coverage.add(int(line))
 
-                    line = line.strip()
-
-                    if not line:
-                        continue
-
-                    try:
-                        coverage.add(
-                            int(line)
-                        )
-
-                    except ValueError:
-                        continue
-
-        except OSError:
+        except (OSError, ValueError):
             pass
 
         return coverage
 
-    # =========================================================
-    # DELETE COVERAGE FILE
-    # =========================================================
+    # ========================================================
+    # NATIVE TARGET
+    # ========================================================
 
-    def _delete_coverage_file(
+    def _run_native_target(
         self,
-        coverage_path: Path
-    ):
+        data: bytes,
+        start: float,
+    ) -> ExecutionResult:
         """
-        Remove temporary coverage file.
+        Execute a native target such as a Windows .exe.
+
+        After execution, attempt to collect GCC/gcov coverage
+        if the target was compiled with coverage instrumentation.
         """
 
         try:
+            completed = subprocess.run(
+                [str(self.target_path)],
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.timeout,
+                cwd=str(self.target_path.parent),
+            )
 
-            if coverage_path.exists():
-                coverage_path.unlink()
+            duration = time.perf_counter() - start
+
+            coverage = self._collect_native_coverage()
+
+            if completed.returncode == 0:
+                status = ExecutionStatus.NORMAL
+            else:
+                status = ExecutionStatus.CRASH
+
+            return ExecutionResult(
+                status=status,
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                duration=duration,
+                coverage=coverage,
+            )
+
+        except subprocess.TimeoutExpired as exc:
+            duration = time.perf_counter() - start
+
+            stdout = self._safe_bytes(exc.stdout)
+            stderr = self._safe_bytes(exc.stderr)
+
+            return ExecutionResult(
+                status=ExecutionStatus.TIMEOUT,
+                exit_code=-1,
+                stdout=stdout,
+                stderr=stderr,
+                duration=duration,
+                coverage=set(),
+            )
+
+        except OSError as exc:
+            duration = time.perf_counter() - start
+
+            return ExecutionResult(
+                status=ExecutionStatus.CRASH,
+                exit_code=-1,
+                stdout=b"",
+                stderr=str(exc).encode(),
+                duration=duration,
+                coverage=set(),
+            )
+
+    # ========================================================
+    # NATIVE COVERAGE COLLECTION
+    # ========================================================
+
+    def _collect_native_coverage(self) -> set:
+        """
+        Collect line coverage from a GCC/gcov-instrumented
+        native target.
+
+        gcov generates files such as:
+
+            vulnerable.c.gcov
+
+        The parser extracts executed source line numbers.
+        """
+
+        coverage = set()
+
+        if self.target_path is None:
+            return coverage
+
+        target_dir = self.target_path.parent
+
+        try:
+            source_files = self._find_native_sources(
+                target_dir
+            )
+
+            if not source_files:
+                return coverage
+
+            for source in source_files:
+                self._run_gcov(
+                    source,
+                    target_dir,
+                )
+
+            gcov_files = list(
+                target_dir.glob("*.gcov")
+            )
+
+            for gcov_file in gcov_files:
+                coverage.update(
+                    self._parse_gcov_file(
+                        gcov_file
+                    )
+                )
+
+        except (
+            OSError,
+            subprocess.SubprocessError,
+        ):
+            return coverage
+
+        return coverage
+
+    # ========================================================
+    # FIND NATIVE SOURCES
+    # ========================================================
+
+    def _find_native_sources(
+        self,
+        directory: Path,
+    ) -> list[Path]:
+        """
+        Find C/C++ source files associated with the native
+        target.
+        """
+
+        extensions = {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+        }
+
+        sources = []
+
+        try:
+            for path in directory.iterdir():
+                if (
+                    path.is_file()
+                    and path.suffix.lower() in extensions
+                ):
+                    sources.append(path)
 
         except OSError:
             pass
 
-    # =========================================================
-    # CONVENIENCE ALIAS
-    # =========================================================
+        return sources
 
-    def execute(
+    # ========================================================
+    # RUN GCOV
+    # ========================================================
+
+    def _run_gcov(
         self,
-        data: bytes
-    ) -> ExecutionResult:
+        source: Path,
+        directory: Path,
+    ) -> None:
         """
-        Alias for run().
+        Run gcov against a source file.
+
+        gcov is optional. If unavailable, native execution
+        continues and coverage remains empty.
         """
 
-        return self.run(data)
+        try:
+            subprocess.run(
+                [
+                    "gcov",
+                    "-b",
+                    "-c",
+                    "-o",
+                    str(directory),
+                    str(source),
+                ],
+                cwd=str(directory),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                check=False,
+            )
 
-    # =========================================================
+        except (
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ):
+            pass
+
+    # ========================================================
+    # GCOV PARSER
+    # ========================================================
+
+    def _parse_gcov_file(
+        self,
+        gcov_path: Path,
+    ) -> set:
+        """
+        Parse a .gcov file.
+
+        Examples:
+
+            1:   41: if (input[0] == 'F')
+            -:   42: unused source line
+            #####: 44: vulnerable_branch();
+
+        Only executable lines with an execution count greater
+        than zero are included.
+        """
+
+        coverage = set()
+
+        if not gcov_path.exists():
+            return coverage
+
+        try:
+            text = gcov_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+
+        except OSError:
+            return coverage
+
+        for line in text.splitlines():
+
+            match = re.match(
+                r"^\s*([^:]+):\s*(\d+):",
+                line,
+            )
+
+            if not match:
+                continue
+
+            count_text = match.group(1).strip()
+            line_number = int(match.group(2))
+
+            # Non-executable line.
+            if count_text == "-":
+                continue
+
+            # Executable but never executed.
+            if "#" in count_text:
+                continue
+
+            try:
+                count = int(count_text)
+
+            except ValueError:
+                continue
+
+            if count > 0:
+                coverage.add(line_number)
+
+        return coverage
+
+    # ========================================================
+    # TARGET TYPE
+    # ========================================================
+
+    def _is_python_target(self) -> bool:
+        """
+        Return True when the configured target is a Python
+        script.
+        """
+
+        if self.target_path is None:
+            return False
+
+        return self.target_path.suffix.lower() == ".py"
+
+    # ========================================================
+    # SAFE BYTE CONVERSION
+    # ========================================================
+
+    @staticmethod
+    def _safe_bytes(value) -> bytes:
+        """
+        Convert subprocess output to bytes safely.
+        """
+
+        if value is None:
+            return b""
+
+        if isinstance(value, bytes):
+            return value
+
+        if isinstance(value, str):
+            return value.encode()
+
+        try:
+            return bytes(value)
+
+        except Exception:
+            return b""
+
+    # ========================================================
     # STATUS HELPERS
-    # =========================================================
+    # ========================================================
 
     def is_crash(
         self,
-        result: ExecutionResult
+        result: ExecutionResult,
     ) -> bool:
         """
         Return True if execution crashed.
         """
 
-        return (
-            result.status
-            == ExecutionStatus.CRASH
-        )
+        return result.status == ExecutionStatus.CRASH
 
     def is_timeout(
         self,
-        result: ExecutionResult
+        result: ExecutionResult,
     ) -> bool:
         """
         Return True if execution timed out.
         """
 
-        return (
-            result.status
-            == ExecutionStatus.TIMEOUT
-        )
+        return result.status == ExecutionStatus.TIMEOUT
 
     def is_normal(
         self,
-        result: ExecutionResult
+        result: ExecutionResult,
     ) -> bool:
         """
         Return True if execution completed normally.
         """
 
-        return (
-            result.status
-            == ExecutionStatus.NORMAL
-        )
+        return result.status == ExecutionStatus.NORMAL
+
+
+# ============================================================
+# MODULE EXPORTS
+# ============================================================
+
+__all__ = [
+    "ExecutionStatus",
+    "ExecutionResult",
+    "Executor",
+]

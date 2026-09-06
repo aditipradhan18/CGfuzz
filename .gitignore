@@ -21,12 +21,20 @@ htmlcov/
 crashes/
 corpus/
 
+# Benchmark runtime artifacts
+benchmark_crashes/
+benchmark_final_demo/
+
 # Generated test corpus and coverage files
 test_corpus/
 *.cover
 
+# Native build artifacts
+*.exe
+*.gcda
+*.gcno
+*.gcov
+
 # OS files
 .DS_Store
 Thumbs.db
-# Native build artifacts
-*.exe

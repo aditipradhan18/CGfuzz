@@ -1,5 +1,4 @@
 from enum import Enum
-from typing import Optional
 
 
 class CrashType(Enum):
@@ -7,6 +6,7 @@ class CrashType(Enum):
     Categories of crashes detected by the fuzzer.
     """
 
+    # Python exceptions
     RUNTIME_ERROR = "RuntimeError"
     VALUE_ERROR = "ValueError"
     TYPE_ERROR = "TypeError"
@@ -17,6 +17,14 @@ class CrashType(Enum):
     MEMORY_ERROR = "MemoryError"
     ASSERTION_ERROR = "AssertionError"
     SYSTEM_EXIT = "SystemExit"
+
+    # Native / Windows crashes
+    ACCESS_VIOLATION = "AccessViolation"
+    STACK_OVERFLOW = "StackOverflow"
+    ILLEGAL_INSTRUCTION = "IllegalInstruction"
+    INTEGER_DIVIDE_BY_ZERO = "IntegerDivideByZero"
+    HEAP_CORRUPTION = "HeapCorruption"
+
     UNKNOWN = "Unknown"
 
 
@@ -52,12 +60,37 @@ class CrashClassification:
 
 class CrashClassifier:
     """
-    Classifies crashes using the error information
-    produced by the target execution.
+    Classifies crashes using information produced by
+    target execution.
 
-    The classifier primarily analyzes stderr and can
-    also classify directly from exception information.
+    Supports:
+
+    - Python exception classification
+    - stderr-based classification
+    - native process exit-code classification
+    - Windows structured exception codes
     """
+
+    # =========================================================
+    # NATIVE WINDOWS EXIT CODES
+    # =========================================================
+
+    NATIVE_EXIT_CODES = {
+        # 0xC0000005
+        3221225477: CrashType.ACCESS_VIOLATION,
+
+        # 0xC00000FD
+        3221225725: CrashType.STACK_OVERFLOW,
+
+        # 0xC000001D
+        3221225501: CrashType.ILLEGAL_INSTRUCTION,
+
+        # 0xC0000094
+        3221225620: CrashType.INTEGER_DIVIDE_BY_ZERO,
+
+        # 0xC0000374
+        3221226356: CrashType.HEAP_CORRUPTION,
+    }
 
     # =========================================================
     # EXCEPTION CLASSIFICATION
@@ -97,6 +130,50 @@ class CrashClassifier:
         )
 
     # =========================================================
+    # NATIVE EXIT-CODE CLASSIFICATION
+    # =========================================================
+
+    def classify_exit_code(
+        self,
+        exit_code: int | None
+    ) -> CrashClassification:
+        """
+        Classify a native crash using its process exit code.
+
+        Windows native crashes are commonly represented as
+        NTSTATUS exception codes encoded as process exit codes.
+        """
+
+        if exit_code is None:
+            return CrashClassification(
+                CrashType.UNKNOWN,
+                ""
+            )
+
+        crash_type = self.NATIVE_EXIT_CODES.get(
+            exit_code
+        )
+
+        if crash_type is None:
+            return CrashClassification(
+                CrashType.UNKNOWN,
+                f"Native process exited with code "
+                f"{exit_code}"
+            )
+
+        hex_code = (
+            f"0x{exit_code & 0xFFFFFFFF:08X}"
+        )
+
+        return CrashClassification(
+            crash_type=crash_type,
+            message=(
+                f"Native process terminated with "
+                f"Windows exception code {hex_code}"
+            )
+        )
+
+    # =========================================================
     # STDERR CLASSIFICATION
     # =========================================================
 
@@ -125,7 +202,7 @@ class CrashClassifier:
             )
 
         # -----------------------------------------------------
-        # Match Python exception names
+        # Python exception names
         # -----------------------------------------------------
 
         exception_map = {
@@ -155,6 +232,29 @@ class CrashClassifier:
                     message=message
                 )
 
+        # -----------------------------------------------------
+        # Native crash keywords
+        # -----------------------------------------------------
+
+        native_patterns = {
+            "access violation": CrashType.ACCESS_VIOLATION,
+            "segmentation fault": CrashType.ACCESS_VIOLATION,
+            "stack overflow": CrashType.STACK_OVERFLOW,
+            "illegal instruction": CrashType.ILLEGAL_INSTRUCTION,
+            "heap corruption": CrashType.HEAP_CORRUPTION,
+        }
+
+        lowered = text.lower()
+
+        for pattern, crash_type in native_patterns.items():
+
+            if pattern in lowered:
+
+                return CrashClassification(
+                    crash_type=crash_type,
+                    message=text
+                )
+
         return CrashClassification(
             crash_type=CrashType.UNKNOWN,
             message=text
@@ -171,7 +271,11 @@ class CrashClassifier:
         """
         Classify an ExecutionResult.
 
-        The result is expected to contain stderr.
+        Classification order:
+
+        1. Known stderr information
+        2. Native process exit code
+        3. Unknown crash
         """
 
         stderr = getattr(
@@ -180,9 +284,46 @@ class CrashClassifier:
             b""
         )
 
-        return self.classify_stderr(
-            stderr
+        exit_code = getattr(
+            result,
+            "exit_code",
+            None
         )
+
+        # -----------------------------------------------------
+        # Try stderr first
+        # -----------------------------------------------------
+
+        stderr_classification = (
+            self.classify_stderr(stderr)
+        )
+
+        if self.is_known(
+            stderr_classification
+        ):
+            return stderr_classification
+
+        # -----------------------------------------------------
+        # Try native exit code
+        # -----------------------------------------------------
+
+        native_classification = (
+            self.classify_exit_code(exit_code)
+        )
+
+        if self.is_known(
+            native_classification
+        ):
+            return native_classification
+
+        # -----------------------------------------------------
+        # Preserve stderr if available
+        # -----------------------------------------------------
+
+        if stderr_classification.message:
+            return stderr_classification
+
+        return native_classification
 
     # =========================================================
     # MESSAGE EXTRACTION
@@ -241,7 +382,7 @@ class CrashClassifier:
     ) -> bool:
         """
         Return True if the crash was assigned a
-        known exception category.
+        known crash category.
         """
 
         return (
