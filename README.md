@@ -2,341 +2,396 @@
 
 ### Coverage-Guided Mutation Fuzzer
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](#)
-[![Tests](https://img.shields.io/badge/tests-86%20passing-brightgreen)](#testing)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](#requirements)
+[![Tests](https://img.shields.io/badge/tests-112%20passing-brightgreen)](#testing)
+[![Release](https://img.shields.io/badge/release-v1.0.0-blue)](#release)
 [![Status](https://img.shields.io/badge/status-research%20prototype-orange)](#current-scope)
-CGFuzz is a modular **coverage-guided mutation fuzzing framework** designed to automatically explore program behavior, discover crashes, and turn raw failures into reproducible, minimized, and deduplicated test cases.
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
 
-Instead of treating every generated input equally, CGFuzz uses **execution feedback** to identify inputs that discover previously unseen coverage and promotes those inputs into a coverage-guided scheduling population.
+CGFuzz is a modular **coverage-guided mutation fuzzing framework** that combines feedback-driven input generation with automated crash triage. It supports Python targets, native C/C++ execution, line/edge/bitmap coverage, ASan/UBSan integration, persistent worker execution, distributed workers, corpus minimization, and persistent crash analysis.
 
-The result is a continuous feedback loop:
+Instead of treating every generated input equally, CGFuzz uses **execution feedback** to identify inputs that discover previously unseen coverage and promotes those inputs into a coverage-guided scheduling population — so the fuzzer spends its time where it actually learns something new about the target.
+
+---
+
+## Table of Contents
+
+- [Why CGFuzz](#why-cgfuzz)
+- [How It Works](#how-it-works)
+- [Features](#features)
+- [Quickstart](#quickstart)
+- [Usage](#usage)
+- [Requirements](#requirements)
+- [Testing](#testing)
+- [Evaluation](#evaluation)
+- [Architecture](#architecture)
+- [Crash Analysis Pipeline](#crash-analysis-pipeline)
+- [Native and Sanitizer Support](#native-and-sanitizer-support)
+- [Persistent and Distributed Execution](#persistent-and-distributed-execution)
+- [Project Structure](#project-structure)
+- [Engineering Design](#engineering-design)
+- [Current Scope](#current-scope)
+- [Roadmap](#roadmap)
+- [Project Philosophy](#project-philosophy)
+- [Release](#release)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Why CGFuzz
+
+Most introductory fuzzers stop at "generate random input, see if it crashes."
+
+CGFuzz closes that loop: when a crash is discovered, the input is automatically classified, minimized to a smaller reproducing case, replayed to verify reproducibility, deduplicated against a persistent crash database, and stored as a structured failure artifact.
+
+As of **v1.0.0**, CGFuzz goes beyond a Python-only prototype. The implementation includes native C/C++ target execution, GCC/gcov-based native coverage, ASan/UBSan integration, line and edge coverage, bitmap feedback, persistent worker execution, coordinator-mediated distributed fuzzing, corpus minimization, and automated end-to-end validation. See [Features](#features) for the capability list.
+
+---
+
+## How It Works
 
 ```text
-              ┌───────────────────┐
-              │    Seed Input     │
-              └─────────┬─────────┘
-                        │
-                        ▼
-              ┌───────────────────┐
-              │      Mutator      │
-              └─────────┬─────────┘
-                        │
-                        ▼
-              ┌───────────────────┐
-              │     Executor      │
-              └─────────┬─────────┘
-                        │
-                ┌───────┴───────┐
-                │               │
-                ▼               ▼
-           Coverage           Crash
-                │               │
-                ▼               ▼
-             Corpus         Classifier
-                │               │
-                ▼               ▼
-           Scheduler        Minimizer
-                │               │
-                │               ▼
-                │          Reproducer
-                │               │
-                │               ▼
-                │         Crash Database
-                │
-                └───────► Mutation
-Why CGFuzz?
+Seed Input
+    |
+    v
+  Mutator
+    |
+    v
+ Executor
+    |
+    +------------------+
+    |                  |
+    v                  v
+Coverage            Crash
+    |                  |
+    v                  v
+ Corpus            Classifier
+    |                  |
+    v                  v
+Scheduler          Minimizer
+    |                  |
+    ^                  v
+    |              Reproducer
+    |                  |
+    |                  v
+    |              Crash DB
+    |
+    +<------ Feedback Loop ------+
+Seed Input — provides the starting fuzzing input.
+Mutator — applies byte-level mutation strategies to generate candidates.
+Executor — runs Python or native C/C++ targets with timeout handling and optional sanitizer support.
+Coverage — new line, edge, or bitmap coverage promotes an input into the corpus.
+Scheduler — prioritizes interesting corpus entries for future mutation.
+Crash Pipeline — detected crashes are classified, minimized, reproduced, deduplicated, and persisted.
+Distributed Workers — multiple workers can execute fuzzing tasks while the coordinator synchronizes corpus and scheduler state.
+Features
+Category	Capabilities
+Fuzzing core	Byte-level mutation, coverage-guided scheduling, dynamic corpus management
+Coverage	Line coverage, edge coverage, bitmap feedback
+Crash handling	Detection, classification, minimization, reproduction, deduplication, persistent artifacts
+Native execution	C/C++ target execution, GCC/gcov coverage
+Sanitizers	ASan and UBSan integration
+Performance	Persistent worker execution
+Distributed	Multi-worker execution with coordinator-mediated corpus/scheduler synchronization
+Interface	CLI campaign configuration and statistics
+Testing	112 passing tests
 
-Pure random mutation can repeatedly generate inputs that exercise code the fuzzer has already explored.
+This table is the canonical feature list for this README. Current Scope and Roadmap reference it rather than repeating the full list.
 
-CGFuzz closes that loop by using coverage as feedback.
+Quickstart
+Clone the repository
+git clone https://github.com/aditipradhan18/CGfuzz.git
+cd CGfuzz
+Install the testing dependency
+pip install pytest
+Run a fuzzing campaign
+python -m src.cli --target src/target.py
+Run a configured campaign
+python -m src.cli \
+    --target src/target.py \
+    --seed CRASH \
+    --iterations 100 \
+    --timeout 1 \
+    --max-input-size 4096 \
+    --reproduction-attempts 3 \
+    --workers 1
+View CLI options
+python -m src.cli --help
+Usage
 
-When an input discovers previously unseen coverage:
+The command-line interface supports:
 
-candidate coverage
-        -
-global coverage
-        =
-new coverage
+--target                  Target Python or native executable
+--seed                    Initial fuzzing seed
+--iterations              Number of mutation/execution iterations
+--timeout                 Per-execution timeout
+--max-input-size          Maximum accepted input size
+--reproduction-attempts   Retries when confirming crash reproducibility
+--workers                 Number of fuzzing workers
 
-If new coverage exists, the input becomes interesting and can be retained for future mutation.
+Example with multiple workers:
 
-This creates a continuous exploration cycle:
+python -m src.cli \
+    --target src/target.py \
+    --seed CRASH \
+    --iterations 1000 \
+    --timeout 1 \
+    --max-input-size 4096 \
+    --reproduction-attempts 3 \
+    --workers 2
+Requirements
+Python 3.10+
+pytest for development/testing
+GCC/gcov support for native C/C++ coverage workflows
+A compiler/runtime environment capable of providing ASan or UBSan for sanitizer-backed native runs
+Testing
 
-Execute
-   ↓
-Measure Coverage
-   ↓
-Discover New Behavior
-   ↓
-Retain Interesting Input
-   ↓
-Prioritize Input
-   ↓
-Mutate
-   ↓
-Execute Again
+Run the complete regression suite:
 
-CGFuzz also processes crashes through an automated analysis pipeline:
+python -m pytest -q
 
-Detect
-  ↓
-Classify
-  ↓
-Minimize
-  ↓
-Reproduce
-  ↓
-Deduplicate
-  ↓
-Persist
-Technical Highlights
-Coverage-Guided Scheduling
+Current validation:
 
-CGFuzz maintains a scheduling population containing inputs associated with coverage discoveries.
+112 passed
 
-Inputs are scored using their coverage characteristics and input size, allowing the scheduler to preferentially select promising inputs for further mutation.
+The suite covers mutation behavior, corpus management, line/edge/bitmap coverage, coverage-guided scheduling, Python and native target execution, timeout handling, input sanitization, crash classification and persistence, crash minimization and reproduction, distributed worker execution, fuzzer orchestration, CLI execution, and end-to-end campaign behavior.
 
-This moves the engine beyond uniform random corpus selection.
+Evaluation
 
-Mutation Engine
+CGFuzz includes a benchmark suite for evaluating fuzzing effectiveness, execution performance, coverage, corpus efficiency, scheduler behavior, sanitization, crash handling, and end-to-end operation.
 
-The mutation layer generates new candidates from existing inputs using byte-level mutation strategies including:
+Baseline vs CGFuzz
 
-Bit flipping
-Byte flipping
-Byte insertion
-Byte deletion
-Byte replacement
-Arithmetic mutation
-Repeated mutation
+A measured 100-iteration comparison against the included target produced:
 
-The mutator operates independently from execution and scheduling, allowing the mutation strategy to evolve without redesigning the campaign engine.
+Metric	Baseline	CGFuzz
+Executions	101	101
+Execution rate	9.34 exec/s	3.36 exec/s
+Crashes found	2	11
+Coverage lines	28	27
+Timeouts	0	0
+Corpus size	101	154
+Reproduced crashes	—	11
+Bitmap coverage	—	25
+Scheduler entries	—	4
 
-Execution Isolation
+Observed differences in this run:
 
-The executor provides a consistent interface between CGFuzz and the target program.
+Throughput change       : -64.03%
+Crash discovery         : 5.50x
+Crash increase          : +450.00%
+Coverage change         : -1 line (-3.57%)
+Corpus increase         : +53 (+52.48%)
 
-Each execution produces normalized information including:
+Benchmark caveat: The 5.50x crash-discovery result is specific to this measured run. Fuzzing results are stochastic and vary with the target, seed, mutation sequence, and execution environment.
 
-Execution Status
-Exit Code
-stdout
-stderr
-Execution Duration
-Coverage
+Coverage note: CGFuzz reached one fewer line than the baseline in this run while finding substantially more crashes. The one-line difference does not by itself indicate a regression: coverage totals and crash discovery measure different outcomes, and the exact paths explored vary with the mutation sequence.
 
-Target failures and timeouts are converted into explicit execution states so the campaign engine can process them consistently.
+Throughput note: The lower CGFuzz campaign throughput reflects additional work for feedback collection, corpus management, scheduling, crash analysis, minimization, reproduction, and persistence.
 
-Coverage Tracking
+Execution Performance
 
-CGFuzz collects target execution coverage and maintains a global set of observed coverage locations.
+A separate real-subprocess benchmark measured:
 
-Only inputs that contribute previously unseen coverage are promoted as interesting corpus entries.
+Executions            : 100
+Normal executions     : 91
+Crashes               : 9
+Timeouts              : 0
+Execution rate        : 9.12 exec/sec
+Avg execution time    : 107.52 ms
+Median execution time : 100.65 ms
+Min execution time    : 88.70 ms
+Max execution time    : 194.64 ms
 
-This prevents the corpus from becoming dominated by inputs that repeatedly exercise the same behavior.
+These measurements represent target execution performance and should be distinguished from full campaign duration, which includes CGFuzz processing overhead.
 
-Automated Crash Triage
+Persistent Execution
 
-A crash is not simply written to a log.
+A verified persistent-worker comparison measured approximately:
 
-CGFuzz processes failures through:
+Persistent worker : 281.92 exec/sec
+Normal subprocess :   6.28 exec/sec
+Approx. speedup   : 45x
 
-Crash
-  │
-  ▼
-Classification
-  │
-  ▼
-Minimization
-  │
-  ▼
-Reproduction
-  │
-  ▼
-Signature Generation
-  │
-  ▼
-Deduplication
-  │
-  ▼
-Persistent Storage
+Results vary with the target and execution environment.
 
-This turns a raw execution failure into a structured debugging artifact.
+End-to-End Demonstration
 
-Crash Analysis Pipeline
-1. Crash Detection
+The final end-to-end benchmark exercises the complete pipeline:
 
-The executor identifies abnormal target execution and reports it to the campaign engine.
+Sanitizer -> Executor -> Coverage -> Scheduler -> Mutation
+    -> Crash Analysis -> Minimization -> Reproduction -> Crash Database
 
-CGFuzz distinguishes:
+A verified final demonstration produced:
 
-Normal execution
-Crashes
-Timeouts
-2. Crash Classification
+Iterations          : 30
+Executions           : 31
+Crashes found        : 3
+Reproduced crashes   : 3
+Timeouts             : 0
+Rejected inputs      : 0
+Coverage lines       : 25
+Bitmap coverage      : 23
+Corpus size          : 3
+Scheduler entries    : 3
+Crash binary files   : 2
+Crash report files   : 3
+Corpus files         : 3
 
-The crash classifier extracts a normalized crash category and associated message.
+CGFuzz end-to-end final demo: PASS
+<details> <summary><strong>Architecture</strong> — expand for the system diagram</summary>
 
-Supported categories include:
+CGFuzz follows a modular architecture where each major responsibility is isolated behind a dedicated component.
 
-RuntimeError
-ValueError
-TypeError
-IndexError
-KeyError
-AttributeError
-ZeroDivisionError
-MemoryError
-AssertionError
-SystemExit
-Unknown
-3. Crash Minimization
+                         +----------------+
+                         |      CLI       |
+                         +-------+--------+
+                                 |
+                                 v
+                         +----------------+
+                         |     CGFuzz     |
+                         | Campaign Engine|
+                         +-------+--------+
+                                 |
+               +-----------------+------------------+
+               |                 |                  |
+               v                 v                  v
+        +-------------+   +-------------+   +-------------+
+        |   Mutator   |   |  Scheduler  |   |   Corpus    |
+        +------+------+   +------+------+   +------+------+
+               |                 |                  |
+               +-----------------+------------------+
+                                 |
+                                 v
+                         +----------------+
+                         |    Executor    |
+                         +-------+--------+
+                                 |
+                                 v
+                         +----------------+
+                         | Target Program |
+                         +-------+--------+
+                                 |
+                    +------------+------------+
+                    |                         |
+                    v                         v
+             +-------------+           +-------------+
+             |   Coverage  |           |    Crash    |
+             |   Tracking  |           |   Pipeline  |
+             +-------------+           +------+------+
+                                             |
+                         +-------------------+------------------+
+                         |                   |                  |
+                         v                   v                  v
+                  +-------------+    +-------------+    +-------------+
+                  | Classifier  |    |  Minimizer  |    | Reproducer |
+                  +-------------+    +-------------+    +------+------+
+                                                                    |
+                                                                    v
+                                                              +-----------+
+                                                              |  Crash DB |
+                                                              +-----------+
+Core Components
+Component	Responsibility
+Fuzzer	Orchestrates the complete fuzzing campaign
+CLI	Converts command-line configuration into a fuzzing campaign
+Executor	Executes Python/native targets and collects execution feedback
+Mutator	Generates mutated test cases
+Corpus	Stores interesting inputs
+CoverageTracker	Maintains observed coverage
+CoverageGuidedScheduler	Prioritizes promising corpus inputs
+CoverageBitmap	Represents bitmap coverage feedback
+CrashClassifier	Categorizes target failures
+CrashMinimizer	Reduces crashing inputs
+CrashReproducer	Verifies reproducibility
+CrashDatabase	Persists and deduplicates crash artifacts
+DistributedWorkerPool	Executes fuzzing tasks across workers
+</details>
+<details> <summary><strong>Crash Analysis Pipeline</strong> — expand for crash-processing details</summary>
 
-A crashing input can contain data that is irrelevant to the failure.
+Crash detection. CGFuzz distinguishes normal execution, crashes, and timeouts.
 
-CGFuzz attempts to remove unnecessary bytes while preserving the crash.
+Crash classification. Crashes are assigned normalized categories such as RuntimeError, ValueError, TypeError, IndexError, KeyError, AttributeError, ZeroDivisionError, MemoryError, AssertionError, SystemExit, and unknown failures. Native sanitizer failures can also be processed through their diagnostic output.
+
+Crash minimization. The minimizer attempts to remove unnecessary bytes while preserving the failure:
 
 Original Input
-      │
-      ▼
+      |
+      v
 Remove Candidate Byte
-      │
-      ▼
+      |
+      v
 Execute Again
-      │
- ┌────┴────┐
- │         │
-Crash     No Crash
- │         │
- ▼         ▼
-Keep     Restore
- │
- └──────► Continue
+      |
+   +--+--+
+   |     |
+ Crash  No Crash
+   |     |
+   v     v
+ Keep  Restore
+   |
+   v
+Continue
 
-The result is a smaller reproducer that is easier to analyze.
-
-4. Crash Reproduction
-
-The minimized input is executed repeatedly to verify that the failure is reproducible.
-
-Example:
+Crash reproduction. Minimized inputs are replayed multiple times to verify reproducibility:
 
 Attempts : 3
 Crashes  : 3
 Normal   : 0
 Timeouts : 0
 
-This helps distinguish stable failures from potentially inconsistent ones.
+Crash deduplication. Normalized crash information is used to generate a persistent crash signature so repeated instances of the same failure can be recognized.
 
-5. Crash Deduplication
-
-A normalized crash signature is generated from the classified crash information.
-
-The signature is hashed using SHA-256 to produce a compact crash identifier.
-
-Repeated occurrences of the same signature can therefore be recognized as duplicates.
-
-6. Persistent Crash Database
-
-Unique crash artifacts are persisted for later inspection.
-
-Example:
+Persistent crash artifacts. Crash artifacts are stored for later inspection:
 
 crashes/
 ├── crash_<hash>.bin
 └── crash_<hash>.txt
 
-The binary artifact stores the minimized crashing input.
+The binary file stores the minimized crashing input. The metadata file records the crash type, crash message, original/minimized input size, reproduction attempts and results, and reproducibility status.
 
-The metadata artifact records information such as:
+The crash database is persistent across campaigns. A database-level unique-crash count can therefore include artifacts from previous runs and should not be interpreted as the number of unique crashes discovered by one campaign.
 
-Crash type
-Crash message
-Original input size
-Minimized input size
-Reproduction attempts
-Reproduction results
-Reproducibility status
-Architecture
+</details>
+<details> <summary><strong>Native and Sanitizer Support</strong> — expand for native execution details</summary>
 
-CGFuzz follows a modular architecture where each major responsibility is isolated behind a dedicated component.
+CGFuzz supports native C/C++ target execution in addition to Python targets.
 
-                         ┌───────────────┐
-                         │      CLI      │
-                         └───────┬───────┘
-                                 │
-                                 ▼
-                         ┌───────────────┐
-                         │     CGFuzz    │
-                         │ Campaign      │
-                         │ Engine        │
-                         └───────┬───────┘
-                                 │
-               ┌─────────────────┼─────────────────┐
-               │                 │                 │
-               ▼                 ▼                 ▼
-         ┌──────────┐      ┌──────────┐      ┌────────────┐
-         │ Mutator  │      │  Corpus  │      │ Scheduler  │
-         └────┬─────┘      └────┬─────┘      └──────┬─────┘
-              │                 │                   │
-              └─────────────────┼───────────────────┘
-                                │
-                                ▼
-                         ┌───────────────┐
-                         │    Executor   │
-                         └───────┬───────┘
-                                 │
-                                 ▼
-                         ┌───────────────┐
-                         │ Target Program│
-                         └───────┬───────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │                         │
-                    ▼                         ▼
-             ┌──────────────┐          ┌──────────────┐
-             │   Coverage   │          │    Crash     │
-             │   Tracking   │          │   Pipeline   │
-             └──────┬───────┘          └──────┬───────┘
-                    │                         │
-                    ▼                         ▼
-                 Corpus                 Classifier
-                    │                         │
-                    ▼                         ▼
-                Scheduler                Minimizer
-                                              │
-                                              ▼
-                                         Reproducer
-                                              │
-                                              ▼
-                                         Crash DB
-Core Components
-Component	Responsibility
-Fuzzer	Orchestrates the complete fuzzing campaign
-CLI	Converts command-line configuration into a fuzzing campaign
-Executor	Executes the target and collects execution results
-Mutator	Generates mutated test cases
-Corpus	Stores inputs that discover new coverage
-Coverage Tracker	Maintains observed execution coverage
-Scheduler	Prioritizes promising corpus inputs
-Sanitizer	Enforces input-level safety constraints
-Crash Classifier	Categorizes target failures
-Crash Minimizer	Reduces crashing inputs
-Crash Reproducer	Verifies crash reproducibility
-Crash Database	Persists and deduplicates crash artifacts
-Project Structure
+Native support includes:
+
+Native executable execution
+GCC/gcov line coverage
+AddressSanitizer integration
+UndefinedBehaviorSanitizer integration
+Sanitizer-aware crash classification
+Timeout handling
+
+Native test targets are included in the repository to validate these execution paths.
+
+</details>
+<details> <summary><strong>Persistent and Distributed Execution</strong> — expand for worker architecture</summary>
+
+Persistent execution. CGFuzz includes a persistent worker execution mode that reuses worker processes across executions instead of creating a new worker process for every input. This reduces process-launch overhead for suitable workloads.
+
+Distributed fuzzing. CGFuzz supports multiple workers through a coordinator-mediated worker pool. The coordinator maintains shared corpus state, coverage state, bitmap feedback, scheduler state, and campaign statistics. Workers execute fuzzing tasks in parallel and return results to the coordinator, which incorporates newly discovered feedback into the campaign state.
+
+</details>
+<details> <summary><strong>Project Structure</strong> — expand for repository layout</summary>
 CGFuzz/
-│
 ├── src/
 │   ├── __init__.py
 │   ├── cli.py
 │   ├── corpus.py
+│   ├── corpus_minimizer.py
 │   ├── coverage_guided.py
 │   ├── coverage_tracker.py
+│   ├── bitmap.py
 │   ├── crash_classifier.py
 │   ├── crash_database.py
 │   ├── crash_minimizer.py
 │   ├── crash_reproducer.py
+│   ├── distributed.py
 │   ├── executor.py
 │   ├── fuzzer.py
 │   ├── mutator.py
@@ -345,6 +400,7 @@ CGFuzz/
 │
 ├── tests/
 │   ├── corpus_test.py
+│   ├── corpus_minimizer_test.py
 │   ├── crash_classifier_test.py
 │   ├── crash_database_test.py
 │   ├── crash_reproducer_test.py
@@ -354,337 +410,69 @@ CGFuzz/
 │   ├── mutator_test.py
 │   ├── process_test.py
 │   ├── sanitizer_test.py
-│   └── test_fuzzer_end_to_end.py
+│   ├── test_bitmap.py
+│   ├── test_fuzzer_end_to_end.py
+│   └── distributed_test.py
 │
-├── docs/
-├── corpus/
-├── crashes/
+├── benchmarks/
+│   ├── baseline.py
+│   ├── cgfuzz_benchmark.py
+│   ├── corpus_efficiency_benchmark.py
+│   ├── coverage_benchmark.py
+│   ├── crash_directory_benchmark.py
+│   ├── crash_minimization_benchmark.py
+│   ├── crash_reproduction_benchmark.py
+│   ├── end_to_end_benchmark.py
+│   ├── execution_performance_benchmark.py
+│   ├── sanitizer_benchmark.py
+│   └── scheduler_benchmark.py
 │
+├── native_targets/
+│   ├── vulnerable.c
+│   ├── ubsan_test.c
+│   └── persistent_timeout_test.py
+│
+├── sanitizer_test.c
 ├── README.md
 └── .gitignore
-Installation
-Requirements
-Python 3.10+
-pytest for development/testing
+</details>
+<details> <summary><strong>Engineering Design</strong> — expand for design principles</summary>
 
-Clone the repository:
+Separation of concerns. Each major subsystem has a dedicated responsibility. The campaign engine coordinates execution while mutation, coverage, scheduling, crash analysis, and persistence remain independently testable.
 
-git clone <repository-url>
-cd CGFuzz
+Feedback-driven exploration. The scheduler is driven by execution feedback rather than treating every corpus entry equally:
 
-Create a virtual environment:
+Program Behavior -> Coverage -> Input Selection -> Mutation -> Program Behavior
 
-python -m venv .venv
+Reproducibility. Crashing inputs are minimized and replayed multiple times before reproduction metadata is recorded.
 
-Windows:
+Persistent failure artifacts. Crashes are converted into persistent artifacts rather than being lost when a fuzzing campaign terminates. This separates discovery from analysis and allows failures to be investigated after the campaign has completed.
 
-.venv\Scripts\activate
+Extensible execution layer. The executor provides an abstraction between the fuzzing engine and the target implementation, allowing additional target backends to be introduced without rewriting the campaign engine.
 
-Install testing dependencies:
-
-pip install pytest
-Quickstart
-
-Run CGFuzz against the included target:
-
-python -m src.cli --target src/target.py
-
-Specify a seed:
-
-python -m src.cli `
-    --target src/target.py `
-    --seed CRASH
-
-Run a larger campaign:
-
-python -m src.cli `
-    --target src/target.py `
-    --seed CRASH `
-    --iterations 1000
-
-Configure the execution timeout:
-
-python -m src.cli `
-    --target src/target.py `
-    --seed CRASH `
-    --iterations 1000 `
-    --timeout 1
-
-Configure crash reproduction:
-
-python -m src.cli `
-    --target src/target.py `
-    --seed CRASH `
-    --iterations 1000 `
-    --reproduction-attempts 3
-
-View all CLI options:
-
-python -m src.cli --help
-Configuration
-Option	Description	Default
---target	Target Python program	Required
---seed	Initial fuzzing input	CRASH
---iterations	Number of mutation iterations	1000
---timeout	Target execution timeout	1.0s
---max-input-size	Maximum accepted input size	4096 bytes
---reproduction-attempts	Crash reproduction attempts	3
-
-Example:
-
-python -m src.cli `
-    --target src/target.py `
-    --seed FUZZ `
-    --iterations 5000 `
-    --timeout 1 `
-    --max-input-size 4096 `
-    --reproduction-attempts 3
-Campaign Metrics
-
-CGFuzz records campaign-level performance and discovery metrics.
-
-Execution Metrics
-Total executions
-Execution rate
-Average execution time
-Campaign duration
-Discovery Metrics
-Total coverage
-Coverage discoveries
-Corpus size
-Scheduler population
-Failure Metrics
-Crashes found
-Crash rate
-Unique crashes
-Reproduced crashes
-Timeouts
-Rejected inputs
-
-These metrics make it possible to evaluate both fuzzing effectiveness and execution efficiency.
-
-# Benchmark Snapshot
-
-A representative 1,000-iteration campaign produced:
-
-```text
-============================================================
-FUZZING CAMPAIGN STATISTICS
-============================================================
-Campaign duration : 133.80 seconds
-Executions        : 1001
-Execution rate    : 7.48 exec/sec
-Avg exec time     : 76.68 ms
-
-Crashes found     : 49
-Reproduced        : 49
-
-Timeouts          : 0
-Rejected inputs   : 0
-
-Coverage lines    : 30
-Coverage finds    : 6
-Corpus size       : 101
-Scheduler entries : 6
-============================================================
-What this demonstrates
-
-The campaign successfully:
-
-executed 1,000+ target inputs
-discovered new coverage
-expanded the fuzzing corpus
-used coverage-guided scheduling
-detected 49 crashes
-reproduced all 49 discovered crashes
-minimized crash inputs
-persisted crash artifacts
-completed without target timeouts or rejected inputs
-
-Note: The crash database is persistent across campaigns. Its total unique-crash count can therefore include artifacts from previous runs and should not be interpreted as the number of unique crashes discovered by a single campaign.
-
-Testing
-
-CGFuzz uses unit, integration, and end-to-end tests.
-
-Run the complete suite:
-
-python -m pytest -q
-
-Current validation:
-
-86 tests passing
-Test Coverage Areas
-
-The test suite validates:
-
-Mutation behavior
-Corpus management
-Coverage tracking
-Coverage-guided scheduling
-Target execution
-Timeout handling
-Input sanitization
-Crash classification
-Crash persistence
-Crash minimization
-Crash reproduction
-Fuzzer orchestration
-CLI execution
-End-to-end campaign behavior
-End-to-End Validation
-
-CGFuzz includes an integration test that exercises the complete pipeline:
-
-Seed
- ↓
-Sanitizer
- ↓
-Executor
- ↓
-Coverage Collection
- ↓
-Coverage-Guided Scheduler
- ↓
-Mutation
- ↓
-Crash Detection
- ↓
-Crash Classification
- ↓
-Crash Minimization
- ↓
-Crash Reproduction
- ↓
-Crash Deduplication
- ↓
-Crash Database
- ↓
-Campaign Statistics
-
-The CLI is also executed as a separate process during testing to verify that the public command-line interface can successfully launch a complete fuzzing campaign.
-
-Engineering Design
-Separation of Concerns
-
-Each major subsystem has a dedicated responsibility.
-
-The fuzzer orchestrates the campaign while execution, mutation, scheduling, coverage, crash analysis, and persistence remain independently testable components.
-
-Feedback-Driven Exploration
-
-The scheduler is driven by actual execution coverage rather than treating every corpus entry equally.
-
-This creates a feedback relationship between:
-
-Program Behavior
-       ↓
-Coverage
-       ↓
-Input Selection
-       ↓
-Mutation
-       ↓
-Program Behavior
-Reproducibility
-
-Crashing inputs are minimized and replayed multiple times before reproduction metadata is recorded.
-
-This makes the resulting crash artifacts significantly more useful for debugging.
-
-Persistent Failure Artifacts
-
-Crashes are converted into persistent artifacts rather than being lost when a fuzzing campaign terminates.
-
-This separates:
-
-Discovery
-
-from:
-
-Analysis
-
-and allows failures to be investigated after the fuzzing campaign has completed.
-
-Extensible Execution Layer
-
-The executor provides an abstraction between the fuzzing engine and target implementation.
-
-This is intentionally designed to make future target backends possible without rewriting the campaign engine.
-
+</details>
 Current Scope
 
-CGFuzz is currently a Python-based fuzzing research prototype.
+CGFuzz v1.0.0 is a research prototype with a complete feedback loop across Python and native C/C++ targets, implementing the capabilities listed in Features plus benchmark and end-to-end validation.
 
-The included target is intentionally structured with deterministic branches and crash conditions so that the fuzzing engine can be developed and validated reproducibly.
-
-The current implementation demonstrates the architecture and feedback mechanisms of a coverage-guided fuzzer.
+CGFuzz is best suited for research, coursework, experimentation, and as a reference implementation for learning how coverage-guided fuzzers work end to end.
 
 It should not currently be described as a production replacement for mature native fuzzers such as AFL++, libFuzzer, or Honggfuzz.
 
 Roadmap
-Completed
- Modular fuzzing engine
- Byte-level mutation engine
- Corpus management
- Coverage collection
- Coverage-guided scheduling
- Target execution
- Timeout handling
- Input sanitization
- Crash detection
- Crash classification
- Crash minimization
- Crash reproduction
- Crash deduplication
- Persistent crash database
- Campaign statistics
- Command-line interface
- End-to-end testing
-Planned
- Native C/C++ target support
- AddressSanitizer-assisted memory-error detection
- UndefinedBehaviorSanitizer integration
- Native edge/bitmap coverage
- Persistent execution mode
- Fork-server execution
- Corpus minimization
- Performance-aware scheduling
- Performance anomaly detection
- Distributed fuzzing
- Benchmarking against baseline mutation strategies
+
+Completed — v1.0.0
+
+All capabilities listed in the Features section are implemented and validated, together with the automated regression suite, benchmark suite, and end-to-end validation.
+
+Future work
+
+ More advanced native instrumentation
  Structure-aware / grammar-based mutation
-Security Research Direction
-
-The long-term direction of CGFuzz is to extend the current feedback-driven engine toward real native software testing.
-
-The intended evolution is:
-
-Python Fuzzing Prototype
-          │
-          ▼
-Coverage-Guided Engine
-          │
-          ▼
-Native Target Execution
-          │
-          ▼
-Native Coverage Instrumentation
-          │
-          ▼
-ASan / UBSan Integration
-          │
-          ▼
-Advanced Crash Triage
-          │
-          ▼
-Performance-Aware Scheduling
-          │
-          ▼
-Scalable Fuzzing Infrastructure
-
-The modular architecture allows these capabilities to be introduced incrementally without replacing the core campaign engine.
-
+ More scalable distributed synchronization
+ Additional target backends
+ Advanced performance-aware scheduling
+ Hardware-assisted instrumentation
 Project Philosophy
 
 CGFuzz is built around a simple principle:
@@ -693,21 +481,26 @@ A fuzzer should learn from every execution.
 
 An execution that discovers nothing should not be treated the same as an execution that unlocks previously unexplored behavior.
 
-A crash should not simply become a log line.
+A crash should not simply become a log line — it should become:
 
-It should become:
-
-A reproducible
-      ↓
-Minimized
-      ↓
-Classified
-      ↓
-Deduplicated
-      ↓
-Persistent
-failure artifact.
+Reproducible -> Minimized -> Classified -> Deduplicated -> Persistent Failure Artifact
 
 The goal is not merely to generate more inputs.
 
 The goal is to spend execution budget intelligently and turn program behavior into actionable testing information.
+
+Release
+
+Current release: CGFuzz v1.0.0
+
+Release commit: ed33411
+
+Contributing
+
+Issues and pull requests are welcome.
+
+When adding a new mutation strategy, coverage backend, execution mode, or crash-analysis feature, please include corresponding tests.
+
+License
+
+MIT — see LICENSE for details.
