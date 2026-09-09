@@ -18,6 +18,10 @@ class CrashType(Enum):
     ASSERTION_ERROR = "AssertionError"
     SYSTEM_EXIT = "SystemExit"
 
+    # Sanitizer findings
+    ASAN_ERROR = "ASanError"
+    UBSAN_ERROR = "UBSanError"
+
     # Native / Windows crashes
     ACCESS_VIOLATION = "AccessViolation"
     STACK_OVERFLOW = "StackOverflow"
@@ -66,6 +70,8 @@ class CrashClassifier:
     Supports:
 
     - Python exception classification
+    - ASan classification
+    - UBSan classification
     - stderr-based classification
     - native process exit-code classification
     - Windows structured exception codes
@@ -127,6 +133,51 @@ class CrashClassifier:
         return CrashClassification(
             crash_type=crash_type,
             message=str(exception)
+        )
+
+    # =========================================================
+    # SANITIZER CLASSIFICATION
+    # =========================================================
+
+    def classify_sanitizer(
+        self,
+        sanitizer: str | None,
+        message: str = ""
+    ) -> CrashClassification:
+        """
+        Classify a sanitizer finding.
+
+        Supported sanitizers:
+
+            asan
+            ubsan
+        """
+
+        if sanitizer is None:
+            return CrashClassification(
+                CrashType.UNKNOWN,
+                message
+            )
+
+        sanitizer_name = str(
+            sanitizer
+        ).lower().strip()
+
+        if sanitizer_name == "asan":
+            return CrashClassification(
+                crash_type=CrashType.ASAN_ERROR,
+                message=message
+            )
+
+        if sanitizer_name == "ubsan":
+            return CrashClassification(
+                crash_type=CrashType.UBSAN_ERROR,
+                message=message
+            )
+
+        return CrashClassification(
+            crash_type=CrashType.UNKNOWN,
+            message=message
         )
 
     # =========================================================
@@ -202,6 +253,31 @@ class CrashClassifier:
             )
 
         # -----------------------------------------------------
+        # ASan
+        # -----------------------------------------------------
+
+        if "AddressSanitizer:" in text:
+
+            return CrashClassification(
+                crash_type=CrashType.ASAN_ERROR,
+                message=text
+            )
+
+        # -----------------------------------------------------
+        # UBSan
+        # -----------------------------------------------------
+
+        if (
+            "UndefinedBehaviorSanitizer:"
+            in text
+        ):
+
+            return CrashClassification(
+                crash_type=CrashType.UBSAN_ERROR,
+                message=text
+            )
+
+        # -----------------------------------------------------
         # Python exception names
         # -----------------------------------------------------
 
@@ -218,7 +294,9 @@ class CrashClassifier:
             "SystemExit": CrashType.SYSTEM_EXIT,
         }
 
-        for exception_name, crash_type in exception_map.items():
+        for exception_name, crash_type in (
+            exception_map.items()
+        ):
 
             if exception_name in text:
 
@@ -237,16 +315,30 @@ class CrashClassifier:
         # -----------------------------------------------------
 
         native_patterns = {
-            "access violation": CrashType.ACCESS_VIOLATION,
-            "segmentation fault": CrashType.ACCESS_VIOLATION,
-            "stack overflow": CrashType.STACK_OVERFLOW,
-            "illegal instruction": CrashType.ILLEGAL_INSTRUCTION,
-            "heap corruption": CrashType.HEAP_CORRUPTION,
+            "access violation":
+                CrashType.ACCESS_VIOLATION,
+
+            "segmentation fault":
+                CrashType.ACCESS_VIOLATION,
+
+            "stack overflow":
+                CrashType.STACK_OVERFLOW,
+
+            "illegal instruction":
+                CrashType.ILLEGAL_INSTRUCTION,
+
+            "integer divide by zero":
+                CrashType.INTEGER_DIVIDE_BY_ZERO,
+
+            "heap corruption":
+                CrashType.HEAP_CORRUPTION,
         }
 
         lowered = text.lower()
 
-        for pattern, crash_type in native_patterns.items():
+        for pattern, crash_type in (
+            native_patterns.items()
+        ):
 
             if pattern in lowered:
 
@@ -273,10 +365,23 @@ class CrashClassifier:
 
         Classification order:
 
-        1. Known stderr information
-        2. Native process exit code
-        3. Unknown crash
+        1. Explicit sanitizer information
+        2. Known stderr information
+        3. Native process exit code
+        4. Unknown crash
         """
+
+        sanitizer = getattr(
+            result,
+            "sanitizer",
+            None
+        )
+
+        sanitizer_message = getattr(
+            result,
+            "sanitizer_message",
+            ""
+        )
 
         stderr = getattr(
             result,
@@ -291,7 +396,25 @@ class CrashClassifier:
         )
 
         # -----------------------------------------------------
-        # Try stderr first
+        # Explicit sanitizer information
+        # -----------------------------------------------------
+
+        if sanitizer is not None:
+
+            sanitizer_classification = (
+                self.classify_sanitizer(
+                    sanitizer,
+                    sanitizer_message
+                )
+            )
+
+            if self.is_known(
+                sanitizer_classification
+            ):
+                return sanitizer_classification
+
+        # -----------------------------------------------------
+        # Try stderr
         # -----------------------------------------------------
 
         stderr_classification = (
@@ -308,7 +431,9 @@ class CrashClassifier:
         # -----------------------------------------------------
 
         native_classification = (
-            self.classify_exit_code(exit_code)
+            self.classify_exit_code(
+                exit_code
+            )
         )
 
         if self.is_known(

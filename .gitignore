@@ -31,9 +31,23 @@ test_corpus/
 
 # Native build artifacts
 *.exe
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
 *.gcda
 *.gcno
 *.gcov
+
+# Temporary / debug files
+error.txt
+executor_backup.txt
 
 # OS files
 .DS_Store

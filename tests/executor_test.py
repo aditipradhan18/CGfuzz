@@ -2,7 +2,7 @@ from pathlib import Path
 
 from src.executor import (
     Executor,
-    ExecutionStatus
+    ExecutionStatus,
 )
 
 
@@ -54,9 +54,8 @@ def test_empty_input():
 
     assert result.status in (
         ExecutionStatus.NORMAL,
-        ExecutionStatus.CRASH
+        ExecutionStatus.CRASH,
     )
-
     assert result.duration >= 0
 
 
@@ -84,9 +83,9 @@ def test_stderr_is_bytes():
     assert isinstance(result.stderr, bytes)
 
 
-# =========================================================
+# ============================================================
 # NATIVE TARGET TESTS
-# =========================================================
+# ============================================================
 
 
 def test_native_normal_execution():
@@ -125,10 +124,10 @@ def test_native_stderr_is_bytes():
     assert isinstance(result.stderr, bytes)
 
 
-def test_native_coverage_is_empty_until_instrumented():
+def test_native_coverage_is_available_when_instrumented():
 
     executor = Executor(str(NATIVE_TARGET))
     result = executor.run(b"FUZZ")
 
     assert isinstance(result.coverage, set)
-    assert result.coverage == set()
+    assert result.coverage

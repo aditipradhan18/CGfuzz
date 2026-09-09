@@ -1,7 +1,23 @@
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
+
+
+# ============================================================
+# PROJECT ROOT
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ============================================================
+# IMPORT CGFUZZ
+# ============================================================
 
 from src.executor import Executor
 from src.crash_reproducer import CrashReproducer
@@ -10,8 +26,6 @@ from src.crash_reproducer import CrashReproducer
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 TARGET = PROJECT_ROOT / "src" / "target.py"
 
@@ -39,7 +53,8 @@ def run_benchmark() -> None:
     )
 
     print(
-        f"Reproduction runs   : {REPRODUCTION_ATTEMPTS}"
+        f"Reproduction runs   : "
+        f"{REPRODUCTION_ATTEMPTS}"
     )
 
     print("=" * 60)
@@ -84,7 +99,8 @@ def run_benchmark() -> None:
     )
 
     duration = (
-        time.perf_counter() - start
+        time.perf_counter()
+        - start
     )
 
     # --------------------------------------------------------

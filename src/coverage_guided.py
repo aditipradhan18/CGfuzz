@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import random
+
 from dataclasses import dataclass
 from typing import Iterable
+
+from .bitmap import CoverageBitmap
 
 
 @dataclass
@@ -12,11 +15,13 @@ class CorpusEntry:
 
     Each entry contains:
         data     -> actual input bytes
-        coverage -> coverage discovered by this input
+        coverage -> line/edge coverage identifiers
+        bitmap   -> optional bitmap representation of edge coverage
     """
 
     data: bytes
     coverage: set
+    bitmap: CoverageBitmap | None = None
 
 
 class CoverageGuidedScheduler:
@@ -28,6 +33,9 @@ class CoverageGuidedScheduler:
 
     Smaller inputs receive a small bonus because they
     are generally cheaper to execute.
+
+    Bitmap coverage is used when available to provide
+    edge-level coverage information.
     """
 
     def __init__(
@@ -37,7 +45,11 @@ class CoverageGuidedScheduler:
     ):
         self.entries: list[CorpusEntry] = []
 
+        # Line/edge coverage identifiers.
         self.total_coverage: set = set()
+
+        # Global edge bitmap.
+        self.total_bitmap = CoverageBitmap()
 
         self.random = random.Random(
             random_seed
@@ -56,12 +68,14 @@ class CoverageGuidedScheduler:
     def add(
         self,
         data: bytes,
-        coverage: Iterable
+        coverage: Iterable,
+        bitmap: CoverageBitmap | None = None
     ) -> bool:
         """
         Add an input when it discovers new coverage.
 
-        Returns True if new coverage was discovered.
+        Returns True if new line/edge or bitmap coverage
+        was discovered.
         """
 
         if not isinstance(data, bytes):
@@ -69,26 +83,53 @@ class CoverageGuidedScheduler:
 
         coverage = set(coverage)
 
+        # Determine new line/edge coverage.
         new_coverage = (
             coverage -
             self.total_coverage
         )
 
-        if not new_coverage:
+        # Determine new bitmap coverage.
+        new_bitmap = False
+
+        if bitmap is not None:
+            if not isinstance(bitmap, CoverageBitmap):
+                raise TypeError(
+                    "bitmap must be a CoverageBitmap"
+                )
+
+            # Check whether the bitmap contains any
+            # previously unseen bitmap slots.
+            for i in range(bitmap.size):
+                if (
+                    bitmap.bitmap[i] != 0
+                    and self.total_bitmap.bitmap[i] == 0
+                ):
+                    new_bitmap = True
+                    break
+
+        # Do not add an input that discovers nothing new.
+        if not new_coverage and not new_bitmap:
             return False
 
         entry = CorpusEntry(
             data=data,
-            coverage=coverage
+            coverage=coverage,
+            bitmap=(
+                bitmap.copy()
+                if bitmap is not None
+                else None
+            )
         )
 
-        self.entries.append(
-            entry
-        )
+        self.entries.append(entry)
 
         self.total_coverage.update(
             new_coverage
         )
+
+        if bitmap is not None:
+            self.total_bitmap.merge(bitmap)
 
         return True
 
@@ -106,7 +147,8 @@ class CoverageGuidedScheduler:
 
         return self.add(
             entry.data,
-            entry.coverage
+            entry.coverage,
+            entry.bitmap
         )
 
     # =========================================================
@@ -122,12 +164,20 @@ class CoverageGuidedScheduler:
 
         More coverage = higher score.
 
+        Bitmap edge coverage contributes to the score
+        when available.
+
         Smaller input = small additional bonus.
         """
 
         coverage_score = len(
             entry.coverage
         )
+
+        bitmap_score = 0
+
+        if entry.bitmap is not None:
+            bitmap_score = entry.bitmap.hit_count()
 
         size = max(
             len(entry.data),
@@ -138,6 +188,7 @@ class CoverageGuidedScheduler:
 
         return (
             float(coverage_score) +
+            float(bitmap_score) +
             size_bonus
         )
 
@@ -241,7 +292,6 @@ class CoverageGuidedScheduler:
         """
 
         for entry in self.entries:
-
             if entry.data == data:
                 return entry
 
@@ -280,6 +330,18 @@ class CoverageGuidedScheduler:
         )
 
     # =========================================================
+    # BITMAP COVERAGE
+    # =========================================================
+
+    def bitmap_coverage_size(self) -> int:
+        """
+        Return the number of globally discovered
+        bitmap coverage slots.
+        """
+
+        return self.total_bitmap.hit_count()
+
+    # =========================================================
     # CORPUS SIZE
     # =========================================================
 
@@ -315,8 +377,8 @@ class CoverageGuidedScheduler:
         """
 
         self.entries.clear()
-
         self.total_coverage.clear()
+        self.total_bitmap.reset()
 
     # =========================================================
     # ITERATION
@@ -375,6 +437,7 @@ class CoverageGuidedScheduler:
         return (
             "CoverageGuidedScheduler("
             f"entries={len(self.entries)}, "
-            f"coverage={len(self.total_coverage)}"
+            f"coverage={len(self.total_coverage)}, "
+            f"bitmap={self.total_bitmap.hit_count()}"
             ")"
         )

@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+import sys
 import shutil
 import time
 from pathlib import Path
+
+
+# ============================================================
+# PROJECT ROOT
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ============================================================
+# IMPORT CGFUZZ
+# ============================================================
 
 from src.crash_database import CrashDatabase
 
@@ -11,7 +27,7 @@ from src.crash_database import CrashDatabase
 # CONFIGURATION
 # ============================================================
 
-BENCHMARK_DIRECTORY = Path("benchmark_crashes")
+BENCHMARK_DIRECTORY = PROJECT_ROOT / "benchmark_crashes"
 
 CRASH_COUNT = 100
 
@@ -21,17 +37,20 @@ CRASH_COUNT = 100
 # ============================================================
 
 def run_benchmark():
+
     print()
     print("=" * 60)
     print("CRASH DIRECTORY BENCHMARK")
     print("=" * 60)
 
     print(
-        f"Crash inputs     : {CRASH_COUNT}"
+        f"Crash inputs     : "
+        f"{CRASH_COUNT}"
     )
 
     print(
-        f"Directory        : {BENCHMARK_DIRECTORY}"
+        f"Directory        : "
+        f"{BENCHMARK_DIRECTORY}"
     )
 
     # ========================================================

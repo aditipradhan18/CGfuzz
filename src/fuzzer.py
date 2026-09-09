@@ -1,3 +1,4 @@
+import atexit
 import time
 
 from .executor import Executor, ExecutionStatus
@@ -9,37 +10,99 @@ from .crash_classifier import CrashClassifier
 from .crash_database import CrashDatabase
 from .crash_reproducer import CrashReproducer
 from .sanitizer import Sanitizer
+from .distributed import DistributedWorkerPool
+
+
+# =============================================================
+# PROCESS-LOCAL DISTRIBUTED EXECUTOR CACHE
+# =============================================================
+
+_worker_executors = {}
+
+
+def _close_worker_executors():
+    """
+    Close all Executor instances owned by the current worker
+    process.
+    """
+
+    for executor in list(
+        _worker_executors.values()
+    ):
+        try:
+            executor.close()
+        except Exception:
+            pass
+
+    _worker_executors.clear()
+
+
+atexit.register(
+    _close_worker_executors
+)
+
+
+# =============================================================
+# DISTRIBUTED WORKER FUNCTION
+# =============================================================
+
+def _distributed_execute(task):
+    """
+    Execute one fuzzing input inside a worker process.
+
+    Each worker process owns its own Executor instance and
+    reuses it for subsequent tasks.
+
+    task:
+        (
+            target,
+            timeout,
+            sanitizers,
+            input_data
+        )
+    """
+
+    target, timeout, sanitizers, input_data = task
+
+    sanitizer_key = tuple(
+        sanitizers or ()
+    )
+
+    key = (
+        str(target),
+        float(timeout),
+        sanitizer_key
+    )
+
+    executor = _worker_executors.get(
+        key
+    )
+
+    if executor is None:
+
+        executor = Executor(
+            target=target,
+            timeout=timeout,
+            sanitizers=sanitizer_key
+        )
+
+        _worker_executors[key] = executor
+
+    return executor.run(
+        input_data
+    )
 
 
 class Fuzzer:
     """
     Coverage-guided mutation fuzzer.
 
-    Pipeline:
+    The coordinator owns the global corpus, scheduler and
+    coverage state.
 
-        Seed
-          ↓
-        Sanitizer
-          ↓
-        Executor
-          ↓
-        Coverage / Crash
-          ↓
-        Crash Classification
-          ↓
-        Crash Minimization
-          ↓
-        Crash Reproduction
-          ↓
-        Crash Database
-          ↓
-        Coverage-Guided Scheduler
-          ↓
-        Corpus
-          ↓
-        Mutation
-          ↓
-        Next Execution
+    Distributed workers only execute inputs. Worker feedback is
+    returned to the coordinator, which merges it into the shared
+    corpus/scheduler before generating future mutations.
     """
 
     def __init__(
@@ -47,8 +110,23 @@ class Fuzzer:
         executor: Executor,
         iterations: int = 1000,
         max_input_size: int = 4096,
-        reproduction_attempts: int = 3
+        reproduction_attempts: int = 3,
+        workers: int = 1
     ):
+        # =====================================================
+        # VALIDATION
+        # =====================================================
+
+        if workers < 1:
+            raise ValueError(
+                "workers must be greater than 0"
+            )
+
+        if iterations < 1:
+            raise ValueError(
+                "iterations must be at least 1"
+            )
+
         # =====================================================
         # CORE COMPONENTS
         # =====================================================
@@ -77,7 +155,7 @@ class Fuzzer:
         )
 
         # =====================================================
-        # COVERAGE-GUIDED SCHEDULER
+        # GLOBAL SCHEDULER
         # =====================================================
 
         self.scheduler = CoverageGuidedScheduler()
@@ -87,15 +165,68 @@ class Fuzzer:
         # =====================================================
 
         self.iterations = iterations
+        self.workers = workers
 
         # =====================================================
-        # CORPUS
+        # DISTRIBUTED EXECUTION CONFIGURATION
+        # =====================================================
+
+        self.worker_pool = None
+
+        if self.workers > 1:
+
+            target = getattr(
+                self.executor,
+                "target",
+                None
+            )
+
+            timeout = getattr(
+                self.executor,
+                "timeout",
+                1.0
+            )
+
+            sanitizers = getattr(
+                self.executor,
+                "sanitizers",
+                ()
+            )
+
+            self.worker_target = target
+            self.worker_timeout = timeout
+            self.worker_sanitizers = tuple(
+                sanitizers
+            )
+
+            self.worker_pool = (
+                DistributedWorkerPool(
+                    _distributed_execute,
+                    workers=self.workers
+                )
+            )
+
+        else:
+
+            self.worker_target = None
+            self.worker_timeout = None
+            self.worker_sanitizers = ()
+
+        # =====================================================
+        # SHARED / GLOBAL CORPUS
+        # =====================================================
+        #
+        # The coordinator owns this corpus.
+        #
+        # Every interesting result returned by any worker is
+        # merged here. Future mutations are selected from this
+        # same corpus and scheduler state.
         # =====================================================
 
         self.corpus = Corpus()
 
         # =====================================================
-        # COVERAGE STATE
+        # GLOBAL COVERAGE STATE
         # =====================================================
 
         self.total_coverage = set()
@@ -121,6 +252,12 @@ class Fuzzer:
         self.timeouts = 0
 
         self.rejected_inputs = 0
+
+        # =====================================================
+        # CAMPAIGN CRASH STATISTICS
+        # =====================================================
+
+        self.campaign_unique_crashes = 0
 
         # =====================================================
         # CAMPAIGN TIMING
@@ -149,31 +286,202 @@ class Fuzzer:
         )
 
     # =========================================================
+    # CLOSE
+    # =========================================================
+
+    def close(self):
+        """
+        Close the distributed worker pool.
+        """
+
+        if self.worker_pool is not None:
+
+            self.worker_pool.close()
+
+            self.worker_pool = None
+
+    def __del__(self):
+        """
+        Best-effort worker cleanup.
+        """
+
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # =========================================================
+    # EXECUTE THROUGH WORKER
+    # =========================================================
+
+    def _execute_worker(
+        self,
+        data: bytes
+    ):
+        """
+        Execute one target input through the distributed pool.
+        """
+
+        if self.worker_pool is None:
+
+            return self.executor.run(
+                data
+            )
+
+        task = (
+            self.worker_target,
+            self.worker_timeout,
+            self.worker_sanitizers,
+            data
+        )
+
+        self.worker_pool.submit(
+            task
+        )
+
+        _, worker_result = (
+            self.worker_pool.get_result(
+                timeout=max(
+                    self.worker_timeout + 5.0,
+                    10.0
+                )
+            )
+        )
+
+        if worker_result.error is not None:
+
+            raise RuntimeError(
+                "Distributed worker failed: "
+                f"{worker_result.error}"
+            )
+
+        return worker_result.result
+
+    # =========================================================
+    # SHARED CORPUS SYNCHRONIZATION
+    # =========================================================
+
+    def synchronize_worker_result(
+        self,
+        data: bytes,
+        result
+    ) -> bool:
+        """
+        Merge feedback from a worker into the coordinator-owned
+        shared corpus and scheduler.
+
+        This is the synchronization boundary:
+
+            Worker
+              ↓
+            ExecutionResult
+              ↓
+            Coordinator
+              ↓
+            Shared Corpus
+              ↓
+            Shared Scheduler
+              ↓
+            Future Mutations
+        """
+
+        coverage = getattr(
+            result,
+            "coverage",
+            set()
+        )
+
+        if coverage is None:
+            coverage = set()
+
+        coverage = set(
+            coverage
+        )
+
+        bitmap = getattr(
+            result,
+            "bitmap",
+            None
+        )
+
+        return self.add_to_corpus(
+            data,
+            coverage,
+            bitmap=bitmap
+        )
+
+    # =========================================================
     # CORPUS + SCHEDULER
     # =========================================================
 
     def add_to_corpus(
         self,
         data: bytes,
-        coverage: set
+        coverage: set,
+        bitmap=None
     ) -> bool:
         """
-        Add an input to the corpus and coverage-guided
-        scheduler when it discovers previously unseen coverage.
+        Add an input to the global/shared corpus and scheduler
+        when it discovers previously unseen line/edge or bitmap
+        coverage.
         """
 
-        coverage = set(coverage)
+        coverage = set(
+            coverage
+        )
+
+        # -----------------------------------------------------
+        # NEW LINE / EDGE COVERAGE
+        # -----------------------------------------------------
 
         new_coverage = (
-            coverage -
+            coverage
+            -
             self.total_coverage
         )
 
-        if not new_coverage:
+        # -----------------------------------------------------
+        # NEW BITMAP COVERAGE
+        # -----------------------------------------------------
+
+        bitmap_has_new_coverage = False
+
+        if bitmap is not None:
+
+            try:
+
+                for index in range(
+                    bitmap.size
+                ):
+
+                    if (
+                        bitmap.bitmap[index] != 0
+                        and
+                        self.scheduler.total_bitmap.bitmap[index] == 0
+                    ):
+
+                        bitmap_has_new_coverage = True
+
+                        break
+
+            except AttributeError:
+
+                bitmap_has_new_coverage = False
+
+        # -----------------------------------------------------
+        # NOTHING NEW
+        # -----------------------------------------------------
+
+        if (
+            not new_coverage
+            and
+            not bitmap_has_new_coverage
+        ):
+
             return False
 
         # -----------------------------------------------------
-        # GLOBAL COVERAGE
+        # UPDATE GLOBAL LINE / EDGE COVERAGE
         # -----------------------------------------------------
 
         self.total_coverage.update(
@@ -181,13 +489,13 @@ class Fuzzer:
         )
 
         # -----------------------------------------------------
-        # COVERAGE DISCOVERY COUNTER
+        # COUNT DISCOVERY
         # -----------------------------------------------------
 
         self.coverage_discoveries += 1
 
         # -----------------------------------------------------
-        # TRADITIONAL CORPUS
+        # ADD TO SHARED CORPUS
         # -----------------------------------------------------
 
         self.corpus.add(
@@ -196,12 +504,13 @@ class Fuzzer:
         )
 
         # -----------------------------------------------------
-        # COVERAGE-GUIDED SCHEDULER
+        # ADD TO SHARED SCHEDULER
         # -----------------------------------------------------
 
         self.scheduler.add(
             data,
-            coverage
+            coverage,
+            bitmap=bitmap
         )
 
         return True
@@ -342,8 +651,12 @@ class Fuzzer:
         metadata = {
             "crash_type": classification.name,
             "message": classification.message,
-            "original_size": len(crashing_input),
-            "minimized_size": len(minimized),
+            "original_size": len(
+                crashing_input
+            ),
+            "minimized_size": len(
+                minimized
+            ),
             "reproduction_attempts": (
                 reproduction.attempts
             ),
@@ -374,6 +687,8 @@ class Fuzzer:
 
         if stored:
 
+            self.campaign_unique_crashes += 1
+
             crash_hash = (
                 self.crash_database.get_hash(
                     signature
@@ -400,6 +715,7 @@ class Fuzzer:
         else:
 
             print()
+
             print(
                 "Duplicate crash - "
                 "already present in database."
@@ -410,58 +726,25 @@ class Fuzzer:
         return stored
 
     # =========================================================
-    # EXECUTE ONE INPUT
+    # PROCESS EXECUTION RESULT
     # =========================================================
 
-    def execute_input(
+    def _process_execution_result(
         self,
         data: bytes,
-        iteration: int | str
+        iteration: int | str,
+        result,
+        execution_duration: float
     ) -> bool:
         """
-        Sanitize and execute one fuzzing input.
+        Process an ExecutionResult produced by either the local
+        executor or a distributed worker.
 
-        Returns True if the target crashes.
+        Worker coverage and bitmap feedback are synchronized into
+        the coordinator-owned shared corpus.
         """
 
-        # =====================================================
-        # SANITIZATION
-        # =====================================================
-
-        sanitization = (
-            self.sanitizer.sanitize(data)
-        )
-
-        if not sanitization.accepted:
-
-            self.rejected_inputs += 1
-
-            print(
-                f"[{iteration}] "
-                f"Input rejected: "
-                f"{sanitization.reason}"
-            )
-
-            return False
-
-        data = sanitization.data
-
-        # =====================================================
-        # EXECUTION
-        # =====================================================
-
-        execution_start = time.perf_counter()
-
         self.executions += 1
-
-        result = self.executor.run(
-            data
-        )
-
-        execution_duration = (
-            time.perf_counter()
-            - execution_start
-        )
 
         self.total_execution_time += (
             execution_duration
@@ -480,7 +763,19 @@ class Fuzzer:
         if coverage is None:
             coverage = set()
 
-        coverage = set(coverage)
+        coverage = set(
+            coverage
+        )
+
+        # =====================================================
+        # BITMAP
+        # =====================================================
+
+        bitmap = getattr(
+            result,
+            "bitmap",
+            None
+        )
 
         # =====================================================
         # TIMEOUT
@@ -538,12 +833,12 @@ class Fuzzer:
             )
 
             # -------------------------------------------------
-            # CRASHING INPUTS CAN STILL ADD COVERAGE
+            # SYNCHRONIZE CRASH COVERAGE
             # -------------------------------------------------
 
-            if self.add_to_corpus(
+            if self.synchronize_worker_result(
                 data,
-                coverage
+                result
             ):
 
                 print(
@@ -569,12 +864,12 @@ class Fuzzer:
         )
 
         # =====================================================
-        # NEW COVERAGE
+        # SYNCHRONIZE WORKER FEEDBACK
         # =====================================================
 
-        if self.add_to_corpus(
+        if self.synchronize_worker_result(
             data,
-            coverage
+            result
         ):
 
             print(
@@ -589,26 +884,236 @@ class Fuzzer:
         return False
 
     # =========================================================
+    # EXECUTE ONE INPUT
+    # =========================================================
+
+    def execute_input(
+        self,
+        data: bytes,
+        iteration: int | str
+    ) -> bool:
+        """
+        Sanitize and execute one fuzzing input.
+
+        In workers=1 mode, execution happens through the normal
+        Executor.
+
+        In workers>1 mode, execution is dispatched to the worker
+        pool and the result is synchronized into the shared
+        coordinator state.
+        """
+
+        # =====================================================
+        # SANITIZATION
+        # =====================================================
+
+        sanitization = (
+            self.sanitizer.sanitize(
+                data
+            )
+        )
+
+        if not sanitization.accepted:
+
+            self.rejected_inputs += 1
+
+            print(
+                f"[{iteration}] "
+                f"Input rejected: "
+                f"{sanitization.reason}"
+            )
+
+            return False
+
+        data = sanitization.data
+
+        # =====================================================
+        # EXECUTION
+        # =====================================================
+
+        execution_start = (
+            time.perf_counter()
+        )
+
+        if self.worker_pool is None:
+
+            result = self.executor.run(
+                data
+            )
+
+        else:
+
+            result = self._execute_worker(
+                data
+            )
+
+        execution_duration = (
+            time.perf_counter()
+            -
+            execution_start
+        )
+
+        return self._process_execution_result(
+            data,
+            iteration,
+            result,
+            execution_duration
+        )
+
+    # =========================================================
+    # DISTRIBUTED BATCH EXECUTION
+    # =========================================================
+
+    def execute_distributed_batch(
+        self,
+        inputs
+    ):
+        """
+        Execute a batch of already-sanitized inputs through
+        the distributed worker pool.
+
+        Each worker result is matched to its original task ID.
+        """
+
+        if self.worker_pool is None:
+
+            results = []
+
+            for iteration, data in inputs:
+
+                start = time.perf_counter()
+
+                result = self.executor.run(
+                    data
+                )
+
+                duration = (
+                    time.perf_counter()
+                    -
+                    start
+                )
+
+                results.append(
+                    (
+                        iteration,
+                        data,
+                        result,
+                        duration
+                    )
+                )
+
+            return results
+
+        # -----------------------------------------------------
+        # SUBMIT ALL TASKS
+        # -----------------------------------------------------
+
+        submitted = {}
+
+        for iteration, data in inputs:
+
+            task = (
+                self.worker_target,
+                self.worker_timeout,
+                self.worker_sanitizers,
+                data
+            )
+
+            task_id = (
+                self.worker_pool.submit(
+                    task
+                )
+            )
+
+            submitted[task_id] = (
+                iteration,
+                data
+            )
+
+        # -----------------------------------------------------
+        # COLLECT RESULTS
+        # -----------------------------------------------------
+
+        completed = []
+
+        while submitted:
+
+            task_id, worker_result = (
+                self.worker_pool.get_result(
+                    timeout=max(
+                        self.worker_timeout + 5.0,
+                        10.0
+                    )
+                )
+            )
+
+            if worker_result.error is not None:
+
+                raise RuntimeError(
+                    "Distributed worker failed: "
+                    f"{worker_result.error}"
+                )
+
+            if task_id not in submitted:
+
+                raise RuntimeError(
+                    "Distributed worker returned "
+                    f"unknown task ID: {task_id}"
+                )
+
+            iteration, data = (
+                submitted.pop(task_id)
+            )
+
+            result = worker_result.result
+
+            duration = getattr(
+                result,
+                "duration",
+                0.0
+            )
+
+            completed.append(
+                (
+                    iteration,
+                    data,
+                    result,
+                    duration
+                )
+            )
+
+        # -----------------------------------------------------
+        # RESTORE SUBMISSION ORDER
+        # -----------------------------------------------------
+
+        completed.sort(
+            key=lambda item: item[0]
+        )
+
+        return completed
+
+    # =========================================================
     # STATISTICS
     # =========================================================
 
     def get_statistics(self) -> dict:
         """
         Return campaign statistics.
-
-        The execution-related metrics are based on fuzzing
-        executions performed through execute_input().
         """
 
-        duration = self.campaign_duration
+        duration = (
+            self.campaign_duration
+        )
 
         if (
             self.campaign_start_time is not None
             and self.campaign_end_time is None
         ):
+
             duration = (
                 time.perf_counter()
-                - self.campaign_start_time
+                -
+                self.campaign_start_time
             )
 
         # -----------------------------------------------------
@@ -618,7 +1123,9 @@ class Fuzzer:
         if duration > 0:
 
             executions_per_second = (
-                self.executions / duration
+                self.executions
+                /
+                duration
             )
 
         else:
@@ -633,7 +1140,8 @@ class Fuzzer:
 
             average_execution_time = (
                 self.total_execution_time
-                / self.executions
+                /
+                self.executions
             )
 
         else:
@@ -648,7 +1156,8 @@ class Fuzzer:
 
             crash_rate = (
                 self.crashes
-                / self.executions
+                /
+                self.executions
             ) * 100
 
         else:
@@ -656,18 +1165,19 @@ class Fuzzer:
             crash_rate = 0.0
 
         # -----------------------------------------------------
-        # UNIQUE CRASH COUNT
+        # UNIQUE CRASH RATE
         # -----------------------------------------------------
 
         unique_crashes = (
-            self.crash_database.count()
+            self.campaign_unique_crashes
         )
 
         if self.executions > 0:
 
             unique_crash_rate = (
                 unique_crashes
-                / self.executions
+                /
+                self.executions
             ) * 100
 
         else:
@@ -690,7 +1200,9 @@ class Fuzzer:
             "crashes": self.crashes,
             "crash_rate": crash_rate,
             "unique_crashes": unique_crashes,
-            "unique_crash_rate": unique_crash_rate,
+            "unique_crash_rate": (
+                unique_crash_rate
+            ),
             "reproduced_crashes": (
                 self.reproduced_crashes
             ),
@@ -710,6 +1222,10 @@ class Fuzzer:
             "scheduler_entries": (
                 self.scheduler.size()
             ),
+            "bitmap_coverage": (
+                self.scheduler.bitmap_coverage_size()
+            ),
+            "workers": self.workers,
         }
 
     # =========================================================
@@ -746,6 +1262,11 @@ class Fuzzer:
         print(
             f"Avg exec time     : "
             f"{stats['average_execution_time'] * 1000:.2f} ms"
+        )
+
+        print(
+            f"Workers           : "
+            f"{stats['workers']}"
         )
 
         print()
@@ -797,6 +1318,11 @@ class Fuzzer:
         print(
             f"Coverage finds    : "
             f"{stats['coverage_discoveries']}"
+        )
+
+        print(
+            f"Bitmap coverage   : "
+            f"{stats['bitmap_coverage']}"
         )
 
         print(
@@ -857,106 +1383,421 @@ class Fuzzer:
         )
 
         print(
+            f"Workers           : "
+            f"{self.workers}"
+        )
+
+        print(
             f"Previous crashes  : "
             f"{self.crash_database.count()}"
         )
 
         print("=" * 60)
 
-        # =====================================================
-        # STEP 1
-        # EXECUTE INITIAL SEED
-        # =====================================================
+        try:
 
-        print()
-        print("[*] Executing initial seed...")
+            # =================================================
+            # STEP 1
+            # EXECUTE INITIAL SEED
+            # =================================================
 
-        self.execute_input(
-            seed,
-            "SEED"
-        )
-
-        # =====================================================
-        # STEP 2
-        # FALLBACK CORPUS
-        # =====================================================
-
-        if self.corpus.size() == 0:
-
-            self.corpus.add(
-                seed,
-                set()
+            print()
+            print(
+                "[*] Executing initial seed..."
             )
 
-        # =====================================================
-        # STEP 3
-        # MUTATION LOOP
-        # =====================================================
+            self.execute_input(
+                seed,
+                "SEED"
+            )
 
-        for iteration in range(
-            1,
-            self.iterations + 1
-        ):
+            # =================================================
+            # STEP 2
+            # FALLBACK CORPUS
+            # =================================================
 
-            # -------------------------------------------------
-            # COVERAGE-GUIDED INPUT SELECTION
-            # -------------------------------------------------
+            if self.corpus.size() == 0:
 
-            if not self.scheduler.is_empty():
-
-                current_input = (
-                    self.scheduler.select()
+                self.corpus.add(
+                    seed,
+                    set()
                 )
+
+            # =================================================
+            # STEP 3
+            # MUTATION LOOP
+            # =================================================
+
+            if self.workers == 1:
+
+                for iteration in range(
+                    1,
+                    self.iterations + 1
+                ):
+
+                    # -----------------------------------------
+                    # SELECT FROM SHARED CORPUS / SCHEDULER
+                    # -----------------------------------------
+
+                    if not self.scheduler.is_empty():
+
+                        current_input = (
+                            self.scheduler.select()
+                        )
+
+                    else:
+
+                        try:
+
+                            current_input = (
+                                self.corpus.random()
+                            )
+
+                        except IndexError:
+
+                            current_input = seed
+
+                    # -----------------------------------------
+                    # MUTATE
+                    # -----------------------------------------
+
+                    mutated_input = (
+                        self.mutator.mutate(
+                            current_input
+                        )
+                    )
+
+                    # -----------------------------------------
+                    # EXECUTE
+                    # -----------------------------------------
+
+                    self.execute_input(
+                        mutated_input,
+                        iteration
+                    )
 
             else:
 
-                try:
+                # =================================================
+                # DISTRIBUTED MODE
+                # =================================================
+                #
+                # The coordinator maintains one shared corpus.
+                # Workers execute inputs in parallel.
+                #
+                # Worker result:
+                #
+                #     worker
+                #       ↓
+                #     result
+                #       ↓
+                #     shared corpus
+                #       ↓
+                #     shared scheduler
+                #       ↓
+                #     next mutation
+                #
+                # At most `self.workers` executions are in flight.
+                # =================================================
 
-                    current_input = (
-                        self.corpus.random()
+                pending = []
+
+                next_iteration = 1
+
+                # -------------------------------------------------
+                # PRIME WORKERS
+                # -------------------------------------------------
+
+                while (
+                    next_iteration <= self.iterations
+                    and len(pending) < self.workers
+                ):
+
+                    # ---------------------------------------------
+                    # SELECT FROM SHARED STATE
+                    # ---------------------------------------------
+
+                    if not self.scheduler.is_empty():
+
+                        current_input = (
+                            self.scheduler.select()
+                        )
+
+                    else:
+
+                        try:
+
+                            current_input = (
+                                self.corpus.random()
+                            )
+
+                        except IndexError:
+
+                            current_input = seed
+
+                    # ---------------------------------------------
+                    # MUTATE
+                    # ---------------------------------------------
+
+                    mutated_input = (
+                        self.mutator.mutate(
+                            current_input
+                        )
                     )
 
-                except IndexError:
+                    # ---------------------------------------------
+                    # SANITIZE
+                    # ---------------------------------------------
 
-                    current_input = seed
+                    sanitization = (
+                        self.sanitizer.sanitize(
+                            mutated_input
+                        )
+                    )
 
-            # -------------------------------------------------
-            # MUTATE
-            # -------------------------------------------------
+                    if not sanitization.accepted:
 
-            mutated_input = (
-                self.mutator.mutate(
-                    current_input
-                )
+                        self.rejected_inputs += 1
+
+                        print(
+                            f"[{next_iteration}] "
+                            f"Input rejected: "
+                            f"{sanitization.reason}"
+                        )
+
+                        next_iteration += 1
+
+                        continue
+
+                    # ---------------------------------------------
+                    # SUBMIT TO WORKER
+                    # ---------------------------------------------
+
+                    task = (
+                        self.worker_target,
+                        self.worker_timeout,
+                        self.worker_sanitizers,
+                        sanitization.data
+                    )
+
+                    task_id = (
+                        self.worker_pool.submit(
+                            task
+                        )
+                    )
+
+                    pending.append(
+                        {
+                            "task_id": task_id,
+                            "iteration": next_iteration,
+                            "data": sanitization.data,
+                        }
+                    )
+
+                    next_iteration += 1
+
+                # -------------------------------------------------
+                # DRAIN + REFILL
+                # -------------------------------------------------
+
+                while pending:
+
+                    # ---------------------------------------------
+                    # WAIT FOR ANY COMPLETED WORKER
+                    # ---------------------------------------------
+
+                    task_id, worker_result = (
+                        self.worker_pool.get_result(
+                            timeout=max(
+                                self.worker_timeout + 5.0,
+                                10.0
+                            )
+                        )
+                    )
+
+                    # ---------------------------------------------
+                    # FIND TASK
+                    # ---------------------------------------------
+
+                    task_info = None
+
+                    for candidate in pending:
+
+                        if candidate["task_id"] == task_id:
+
+                            task_info = candidate
+
+                            break
+
+                    if task_info is None:
+
+                        raise RuntimeError(
+                            "Distributed worker returned "
+                            f"unknown task ID: {task_id}"
+                        )
+
+                    pending.remove(
+                        task_info
+                    )
+
+                    # ---------------------------------------------
+                    # WORKER ERROR
+                    # ---------------------------------------------
+
+                    if worker_result.error is not None:
+
+                        raise RuntimeError(
+                            "Distributed worker failed: "
+                            f"{worker_result.error}"
+                        )
+
+                    # ---------------------------------------------
+                    # GET RESULT
+                    # ---------------------------------------------
+
+                    result = worker_result.result
+
+                    execution_duration = getattr(
+                        result,
+                        "duration",
+                        0.0
+                    )
+
+                    # ---------------------------------------------
+                    # SYNCHRONIZE RESULT
+                    #
+                    # This immediately merges coverage and bitmap
+                    # information into the shared coordinator state.
+                    # ---------------------------------------------
+
+                    self._process_execution_result(
+                        task_info["data"],
+                        task_info["iteration"],
+                        result,
+                        execution_duration
+                    )
+
+                    # ---------------------------------------------
+                    # REFILL WORKER
+                    # ---------------------------------------------
+
+                    if (
+                        next_iteration
+                        <= self.iterations
+                    ):
+
+                        # -----------------------------------------
+                        # SELECT FROM UPDATED SHARED STATE
+                        # -----------------------------------------
+
+                        if not self.scheduler.is_empty():
+
+                            current_input = (
+                                self.scheduler.select()
+                            )
+
+                        else:
+
+                            try:
+
+                                current_input = (
+                                    self.corpus.random()
+                                )
+
+                            except IndexError:
+
+                                current_input = seed
+
+                        # -----------------------------------------
+                        # MUTATE
+                        # -----------------------------------------
+
+                        mutated_input = (
+                            self.mutator.mutate(
+                                current_input
+                            )
+                        )
+
+                        # -----------------------------------------
+                        # SANITIZE
+                        # -----------------------------------------
+
+                        sanitization = (
+                            self.sanitizer.sanitize(
+                                mutated_input
+                            )
+                        )
+
+                        if not sanitization.accepted:
+
+                            self.rejected_inputs += 1
+
+                            print(
+                                f"[{next_iteration}] "
+                                f"Input rejected: "
+                                f"{sanitization.reason}"
+                            )
+
+                            next_iteration += 1
+
+                            continue
+
+                        # -----------------------------------------
+                        # SUBMIT
+                        # -----------------------------------------
+
+                        task = (
+                            self.worker_target,
+                            self.worker_timeout,
+                            self.worker_sanitizers,
+                            sanitization.data
+                        )
+
+                        task_id = (
+                            self.worker_pool.submit(
+                                task
+                            )
+                        )
+
+                        pending.append(
+                            {
+                                "task_id": task_id,
+                                "iteration": next_iteration,
+                                "data": sanitization.data,
+                            }
+                        )
+
+                        next_iteration += 1
+
+        finally:
+
+            # =====================================================
+            # STOP CAMPAIGN TIMER
+            # =====================================================
+
+            self.campaign_end_time = (
+                time.perf_counter()
             )
 
-            # -------------------------------------------------
-            # EXECUTE
-            # -------------------------------------------------
-
-            self.execute_input(
-                mutated_input,
-                iteration
+            self.campaign_duration = (
+                self.campaign_end_time
+                -
+                self.campaign_start_time
             )
 
-        # =====================================================
-        # STOP CAMPAIGN TIMER
-        # =====================================================
+            self.print_statistics()
 
-        self.campaign_end_time = (
-            time.perf_counter()
-        )
+            # -----------------------------------------------------
+            # WORKER CLEANUP
+            # -----------------------------------------------------
 
-        self.campaign_duration = (
-            self.campaign_end_time
-            - self.campaign_start_time
-        )
+            self.close()
 
         # =====================================================
-        # FINAL STATISTICS
+        # RETURN STATISTICS
         # =====================================================
 
-        self.print_statistics()
+        return self.get_statistics()
 
 
 # =============================================================

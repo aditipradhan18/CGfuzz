@@ -230,6 +230,32 @@ class Corpus:
         return iter(self.inputs)
 
     # =========================================================
+    # CORPUS MINIMIZATION
+    # =========================================================
+
+    def minimize(self):
+        """
+        Reduce the corpus while preserving its combined coverage.
+
+        Uses the greedy set-cover algorithm from CorpusMinimizer.
+
+        Returns:
+            MinimizedCorpus containing the selected inputs
+            and their combined coverage.
+        """
+
+        from .corpus_minimizer import CorpusMinimizer
+
+        minimizer = CorpusMinimizer()
+
+        result = minimizer.minimize(
+            self.inputs,
+            self.coverage,
+        )
+
+        return result
+
+    # =========================================================
     # REPRESENTATION
     # =========================================================
 

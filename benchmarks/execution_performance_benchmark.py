@@ -5,6 +5,21 @@ import sys
 import time
 from pathlib import Path
 
+
+# ============================================================
+# PROJECT ROOT
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ============================================================
+# IMPORT CGFUZZ
+# ============================================================
+
 from src.executor import Executor, ExecutionStatus
 
 
@@ -14,7 +29,6 @@ from src.executor import Executor, ExecutionStatus
 
 ITERATIONS = 100
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TARGET = PROJECT_ROOT / "src" / "target.py"
 
 INPUTS = [
@@ -37,6 +51,7 @@ INPUTS = [
 # ============================================================
 
 def run_benchmark() -> None:
+
     print("=" * 60)
     print("EXECUTION PERFORMANCE BENCHMARK")
     print("=" * 60)
@@ -81,7 +96,11 @@ def run_benchmark() -> None:
             timeouts += 1
 
         if (i + 1) % 20 == 0:
-            elapsed = time.perf_counter() - benchmark_start
+
+            elapsed = (
+                time.perf_counter()
+                - benchmark_start
+            )
 
             rate = (
                 (i + 1) / elapsed
@@ -96,7 +115,8 @@ def run_benchmark() -> None:
             )
 
     benchmark_duration = (
-        time.perf_counter() - benchmark_start
+        time.perf_counter()
+        - benchmark_start
     )
 
     # ========================================================
@@ -105,26 +125,23 @@ def run_benchmark() -> None:
 
     executions = len(execution_times)
 
-    if benchmark_duration > 0:
-        execution_rate = (
-            executions / benchmark_duration
-        )
-    else:
-        execution_rate = 0.0
+    execution_rate = (
+        executions / benchmark_duration
+        if benchmark_duration > 0
+        else 0.0
+    )
 
-    if execution_times:
-        average_execution_time = statistics.mean(
-            execution_times
-        )
-    else:
-        average_execution_time = 0.0
+    average_execution_time = (
+        statistics.mean(execution_times)
+        if execution_times
+        else 0.0
+    )
 
-    if execution_times:
-        median_execution_time = statistics.median(
-            execution_times
-        )
-    else:
-        median_execution_time = 0.0
+    median_execution_time = (
+        statistics.median(execution_times)
+        if execution_times
+        else 0.0
+    )
 
     minimum_execution_time = (
         min(execution_times)
@@ -148,19 +165,23 @@ def run_benchmark() -> None:
     print("=" * 60)
 
     print(
-        f"Executions            : {executions}"
+        f"Executions            : "
+        f"{executions}"
     )
 
     print(
-        f"Normal executions     : {normal_executions}"
+        f"Normal executions     : "
+        f"{normal_executions}"
     )
 
     print(
-        f"Crashes               : {crashes}"
+        f"Crashes               : "
+        f"{crashes}"
     )
 
     print(
-        f"Timeouts              : {timeouts}"
+        f"Timeouts              : "
+        f"{timeouts}"
     )
 
     print(
@@ -205,7 +226,12 @@ def run_benchmark() -> None:
         )
         return
 
-    if normal_executions + crashes + timeouts != executions:
+    if (
+        normal_executions
+        + crashes
+        + timeouts
+        != executions
+    ):
         print(
             "[FAIL] Execution status accounting mismatch."
         )
