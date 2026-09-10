@@ -1,0 +1,29 @@
+name: CGFuzz Tests
+
+on:
+  push:
+    branches:
+      - master
+      - feature/native-fuzzing
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run test suite
+        run: python -m pytest -q
